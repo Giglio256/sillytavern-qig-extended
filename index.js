@@ -677,10 +677,10 @@ function ensureQigExplanationDisclosureStyles() {
     flex: 0 0 auto;
     border-right: 1.5px solid currentColor;
     border-bottom: 1.5px solid currentColor;
-    transform: rotate(45deg);
+    transform: rotate(-45deg);
     transition: transform 120ms ease;
 }
-.qig-explanation-disclosure[open] > summary::after { transform: rotate(-135deg); }`;
+.qig-explanation-disclosure[open] > summary::after { transform: rotate(45deg); }`;
     document.head.appendChild(style);
 }
 

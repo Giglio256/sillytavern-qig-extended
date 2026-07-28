@@ -416,6 +416,7 @@ const QIG_DEFAULT_COLLAPSED_SECTIONS = {
     setupPanel: false,
 };
 let qigKeyboardShortcutsBound = false;
+let qigExplanationObserver = null;
 
 function normalizeNbpDirectorPreset(value) {
     return NBP_DIRECTOR_PROMPTS[value] ? value : "house";
@@ -571,6 +572,125 @@ function setupQigCollapsibleSection(sectionId, buttonId, contentId) {
         setCollapsedSection(sectionId, collapsed);
         apply(collapsed);
     };
+}
+
+function splitQigExplanation(text) {
+    const raw = String(text || "");
+    if (!raw.trim()) return null;
+
+    try {
+        if (typeof Intl?.Segmenter === "function") {
+            const segments = [...new Intl.Segmenter(undefined, { granularity: "sentence" }).segment(raw)];
+            if (segments.length > 1) {
+                const first = String(segments[0]?.segment || "").trim();
+                const end = Number(segments[0]?.index || 0) + String(segments[0]?.segment || "").length;
+                if (first && raw.slice(end).trim()) return { first, end };
+            }
+        }
+    } catch {
+        // Fall through to the simple sentence splitter.
+    }
+
+    const match = raw.match(/^([\s\S]*?[.!?])(?:\s+)(?=\S)/);
+    if (!match) return null;
+    const first = String(match[1] || "").trim();
+    const end = match[0].length;
+    return first && raw.slice(end).trim() ? { first, end } : null;
+}
+
+function removeLeadingTextFromClone(root, characterCount) {
+    let remaining = Math.max(0, Number(characterCount) || 0);
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+
+    for (const node of nodes) {
+        if (remaining <= 0) break;
+        const value = String(node.nodeValue || "");
+        if (remaining >= value.length) {
+            remaining -= value.length;
+            node.nodeValue = "";
+        } else {
+            node.nodeValue = value.slice(remaining);
+            remaining = 0;
+        }
+    }
+
+    const trimWalker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    while (trimWalker.nextNode()) {
+        const node = trimWalker.currentNode;
+        if (!String(node.nodeValue || "").trim()) continue;
+        node.nodeValue = String(node.nodeValue || "").replace(/^\s+/, "");
+        break;
+    }
+}
+
+function enhanceQigExplanationElement(element) {
+    if (!(element instanceof Element)) return;
+    const existingDisclosure = element.querySelector?.(":scope > .qig-explanation-disclosure");
+    if (element.dataset.qigExplanationProcessed === "true" && existingDisclosure) return;
+    if (element.dataset.qigExplanationProcessed === "true") delete element.dataset.qigExplanationProcessed;
+    if (element.closest("#qig-macro-inspector-list")) return;
+    if (element.closest(".qig-explanation-disclosure")) return;
+
+    const split = splitQigExplanation(element.textContent || "");
+    if (!split) return;
+
+    const remainderClone = element.cloneNode(true);
+    removeLeadingTextFromClone(remainderClone, split.end);
+    if (!String(remainderClone.textContent || "").trim()) return;
+
+    const details = document.createElement("details");
+    details.className = "qig-explanation-disclosure";
+    details.style.margin = "0";
+
+    const summary = document.createElement("summary");
+    summary.style.cursor = "pointer";
+    summary.style.listStyle = "none";
+    summary.style.display = "block";
+    summary.textContent = split.first;
+
+    const body = document.createElement("div");
+    body.className = "qig-explanation-disclosure__body";
+    body.style.marginTop = "4px";
+    while (remainderClone.firstChild) body.appendChild(remainderClone.firstChild);
+
+    details.append(summary, body);
+    element.dataset.qigExplanationProcessed = "true";
+    element.replaceChildren(details);
+}
+
+function ensureQigExplanationDisclosureStyles() {
+    if (document.getElementById("qig-explanation-disclosure-styles")) return;
+    const style = document.createElement("style");
+    style.id = "qig-explanation-disclosure-styles";
+    style.textContent = `.qig-explanation-disclosure > summary { list-style: none; }
+.qig-explanation-disclosure > summary::-webkit-details-marker { display: none; }
+.qig-explanation-disclosure > summary::marker { content: ""; }`;
+    document.head.appendChild(style);
+}
+
+function setupQigExplanationDisclosures(root = document.getElementById("qig-settings")) {
+    ensureQigExplanationDisclosureStyles();
+    qigExplanationObserver?.disconnect?.();
+    qigExplanationObserver = null;
+    if (!root) return;
+
+    const selector = "small, .form-hint, .qig-help, .qig-muted, .qig-description, [data-qig-explanation]";
+    const processWithin = (node) => {
+        const element = node instanceof Element ? node : node?.parentElement;
+        if (!(element instanceof Element)) return;
+        if (element.matches(selector)) enhanceQigExplanationElement(element);
+        element.querySelectorAll?.(selector).forEach(enhanceQigExplanationElement);
+    };
+
+    processWithin(root);
+    qigExplanationObserver = new MutationObserver((records) => {
+        for (const record of records) {
+            record.addedNodes.forEach(node => processWithin(node));
+        }
+    });
+    qigExplanationObserver.observe(root, { childList: true, subtree: true });
 }
 
 function setupSettingsSearch() {
@@ -13607,7 +13727,7 @@ async function regenerateImage(effectiveRequest = lastEffectiveRequest, returnFo
         && (!sourceTargetSnapshot
             || (sourceMessageId && sourceTargetSnapshot.messageId !== sourceMessageId)
             || (sourceMessageSignature && sourceTargetSnapshot.signature !== sourceMessageSignature)))) {
-        showStatus("❌ The original source message changed; regeneration was cancelled");
+        log("Regeneration skipped because the original source message changed");
         return;
     }
     const provider = effectiveRequest?.provider
@@ -13739,7 +13859,6 @@ async function regenerateImage(effectiveRequest = lastEffectiveRequest, returnFo
     } catch (e) {
         if (e.name === "AbortError") {
             log("Regeneration cancelled by user");
-            toastr.info("Generation cancelled");
         } else {
             showStatus(`❌ ${e.message}`);
             log(`Regenerate error: ${e.message}`);
@@ -19308,6 +19427,7 @@ function createUI() {
     renderComfyWorkflowPresets();
     renderContextualFilters();
     renderContextMediaSummary();
+    setupQigExplanationDisclosures(document.getElementById("qig-settings"));
 
     document.querySelectorAll(".qig-wizard-btn").forEach(btn => {
         btn.onclick = () => showSetupWizard();
@@ -20933,7 +21053,6 @@ async function generateImageInjectPalette() {
     } catch (e) {
         if (e.name === "AbortError") {
             log("Palette inject: Generation cancelled by user");
-            toastr.info("Generation cancelled");
             return { status: "cancelled", generated: generatedCount, failed: failedCount };
         } else {
             log(`Palette inject: Error: ${e.message}`);
@@ -21087,7 +21206,6 @@ async function generateImageFromPlainDescription() {
     } catch (e) {
         if (e.name === "AbortError") {
             log("Plain description generation cancelled by user");
-            toastr.info("Generation cancelled");
         } else {
             log(`Plain description error: ${e.message}`);
             toastr.error("Plain description generation failed: " + e.message, "", { timeOut: 0, extendedTimeOut: 0, closeButton: true, escapeHtml: true });
@@ -21328,7 +21446,6 @@ async function generateImage() {
     } catch (e) {
         if (e.name === "AbortError") {
             log("Generation cancelled by user");
-            toastr.info("Generation cancelled");
             return { status: "cancelled", generated: 0, failed: 0 };
         } else {
             log(`Error: ${e.message}`);
@@ -21875,7 +21992,6 @@ async function processInjectMessage(messageText, messageIndex, job = null) {
             } catch (e) {
                 if (e.name === "AbortError") {
                     log("Inject: Generation cancelled by user");
-                    toastr.info("Generation cancelled");
                     break; // Exit the entire match loop on cancel
                 } else {
                     log(`Inject: Generation error: ${e.message}`);
@@ -21963,7 +22079,7 @@ async function runQigSlashGenerateCommand(args = {}, unnamedPrompt = "") {
             outcome = await runGeneration();
         }
         if (outcome?.status === "busy") return "QIG: generation is already running.";
-        if (outcome?.status === "cancelled") return "QIG: generation cancelled.";
+        if (outcome?.status === "cancelled") return "";
         if (outcome?.status === "failed") return `QIG failed: ${outcome.message || "generation failed"}`;
         if (outcome?.status === "partial") return `QIG: generated ${outcome.generated} image(s); ${outcome.failed} generation(s) failed.`;
         return `QIG: generation complete${Number.isInteger(outcome?.generated) ? ` (${outcome.generated} image(s))` : ""}.`;

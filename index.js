@@ -353,9 +353,11 @@ const QIG_DEFAULT_COLLAPSED_SECTIONS = {
     promptAdvanced: true,
     injectOptions: true,
     advancedSettings: true,
+    macroInspector: true,
     setupPanel: false,
 };
 let qigKeyboardShortcutsBound = false;
+let qigExplanationObserver = null;
 
 function normalizeNbpDirectorPreset(value) {
     return NBP_DIRECTOR_PROMPTS[value] ? value : "house";
@@ -511,6 +513,125 @@ function setupQigCollapsibleSection(sectionId, buttonId, contentId) {
     };
 }
 
+function splitQigExplanation(text) {
+    const raw = String(text || "");
+    if (!raw.trim()) return null;
+
+    try {
+        if (typeof Intl?.Segmenter === "function") {
+            const segments = [...new Intl.Segmenter(undefined, { granularity: "sentence" }).segment(raw)];
+            if (segments.length > 1) {
+                const first = String(segments[0]?.segment || "").trim();
+                const end = Number(segments[0]?.index || 0) + String(segments[0]?.segment || "").length;
+                if (first && raw.slice(end).trim()) return { first, end };
+            }
+        }
+    } catch {
+        // Fall through to the simple sentence splitter.
+    }
+
+    const match = raw.match(/^([\s\S]*?[.!?])(?:\s+)(?=\S)/);
+    if (!match) return null;
+    const first = String(match[1] || "").trim();
+    const end = match[0].length;
+    return first && raw.slice(end).trim() ? { first, end } : null;
+}
+
+function removeLeadingTextFromClone(root, characterCount) {
+    let remaining = Math.max(0, Number(characterCount) || 0);
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+
+    for (const node of nodes) {
+        if (remaining <= 0) break;
+        const value = String(node.nodeValue || "");
+        if (remaining >= value.length) {
+            remaining -= value.length;
+            node.nodeValue = "";
+        } else {
+            node.nodeValue = value.slice(remaining);
+            remaining = 0;
+        }
+    }
+
+    const trimWalker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    while (trimWalker.nextNode()) {
+        const node = trimWalker.currentNode;
+        if (!String(node.nodeValue || "").trim()) continue;
+        node.nodeValue = String(node.nodeValue || "").replace(/^\s+/, "");
+        break;
+    }
+}
+
+function enhanceQigExplanationElement(element) {
+    if (!(element instanceof Element)) return;
+    const existingDisclosure = element.querySelector?.(":scope > .qig-explanation-disclosure");
+    if (element.dataset.qigExplanationProcessed === "true" && existingDisclosure) return;
+    if (element.dataset.qigExplanationProcessed === "true") delete element.dataset.qigExplanationProcessed;
+    if (element.closest("#qig-macro-inspector-list")) return;
+    if (element.closest(".qig-explanation-disclosure")) return;
+
+    const split = splitQigExplanation(element.textContent || "");
+    if (!split) return;
+
+    const remainderClone = element.cloneNode(true);
+    removeLeadingTextFromClone(remainderClone, split.end);
+    if (!String(remainderClone.textContent || "").trim()) return;
+
+    const details = document.createElement("details");
+    details.className = "qig-explanation-disclosure";
+    details.style.margin = "0";
+
+    const summary = document.createElement("summary");
+    summary.style.cursor = "pointer";
+    summary.style.listStyle = "none";
+    summary.style.display = "block";
+    summary.textContent = split.first;
+
+    const body = document.createElement("div");
+    body.className = "qig-explanation-disclosure__body";
+    body.style.marginTop = "4px";
+    while (remainderClone.firstChild) body.appendChild(remainderClone.firstChild);
+
+    details.append(summary, body);
+    element.dataset.qigExplanationProcessed = "true";
+    element.replaceChildren(details);
+}
+
+function ensureQigExplanationDisclosureStyles() {
+    if (document.getElementById("qig-explanation-disclosure-styles")) return;
+    const style = document.createElement("style");
+    style.id = "qig-explanation-disclosure-styles";
+    style.textContent = `.qig-explanation-disclosure > summary { list-style: none; }
+.qig-explanation-disclosure > summary::-webkit-details-marker { display: none; }
+.qig-explanation-disclosure > summary::marker { content: ""; }`;
+    document.head.appendChild(style);
+}
+
+function setupQigExplanationDisclosures(root = document.getElementById("qig-settings")) {
+    ensureQigExplanationDisclosureStyles();
+    qigExplanationObserver?.disconnect?.();
+    qigExplanationObserver = null;
+    if (!root) return;
+
+    const selector = "small, .form-hint, .qig-help, .qig-muted, .qig-description, [data-qig-explanation]";
+    const processWithin = (node) => {
+        const element = node instanceof Element ? node : node?.parentElement;
+        if (!(element instanceof Element)) return;
+        if (element.matches(selector)) enhanceQigExplanationElement(element);
+        element.querySelectorAll?.(selector).forEach(enhanceQigExplanationElement);
+    };
+
+    processWithin(root);
+    qigExplanationObserver = new MutationObserver((records) => {
+        for (const record of records) {
+            record.addedNodes.forEach(node => processWithin(node));
+        }
+    });
+    qigExplanationObserver.observe(root, { childList: true, subtree: true });
+}
+
 function setupSettingsSearch() {
     const searchInput = document.getElementById("qig-settings-search");
     const clearBtn = document.getElementById("qig-settings-search-clear");
@@ -532,6 +653,7 @@ function setupSettingsSearch() {
             ["promptAdvanced", "qig-prompt-advanced-toggle", "qig-prompt-advanced-content"],
             ["injectOptions", "qig-inject-options-toggle", "qig-inject-options"],
             ["advancedSettings", "qig-advanced-settings-toggle", "qig-advanced-settings"],
+            ["macroInspector", "qig-macro-inspector-toggle", "qig-macro-inspector-content"],
         ];
         pairs.forEach(([key, btnId, contentId]) => {
             const button = document.getElementById(btnId);
@@ -853,6 +975,141 @@ function applyChatGptNbpWorkflowPreset({ persist = true, notify = true } = {}) {
     return s;
 }
 
+const DEFAULT_TEXT_AI_IMAGE_PROMPT_NATURAL_TEMPLATE = `{{qig_timestamp_prefix}}[STANDALONE IMAGE PROMPT GENERATION TASK]{{qig_skin_enforce}}
+
+CRITICAL INSTRUCTIONS:
+- IGNORE any ambient chat history outside the selected scene below
+- Generate ONLY a new image prompt based on the selected scene below
+- DO NOT repeat or paraphrase the scene text verbatim
+- This is a standalone task, not a continuation of chat
+{{qig_multi_message_context_block}}
+
+[Output ONLY an image generation prompt. No commentary or explanation.]{{qig_skin_enforce}}
+
+CHARACTER REFERENCE:
+{{qig_appearance_context}}{{qig_exact_name_block}}{{qig_user_name_block}}{{qig_identity_requirement_block}}{{qig_subject_priority_block}}
+{{qig_natural_scene_line}}
+
+Write a detailed image prompt describing:
+- The characters involved with their defining visual traits (hair color, eye color, outfit, distinguishing features)
+{{qig_natural_exact_name_bullet}}
+{{qig_user_scene_requirement_bullet}}
+- Preserve explicit ages, species, creature types, and nonhuman identities from the scene/profile instead of replacing them with generic human labels
+- If from known media/franchise, include the series name and character's canonical appearance
+- Their poses, expressions, and body language
+- The setting/background
+- Lighting and atmosphere
+- High quality visual details (sharp focus, detailed rendering, etc.){{qig_natural_enhancement_section}}{{qig_natural_restrictions}}
+
+Prompt:{{qig_output_ref_suffix}}{{qig_prefill_hint}}`;
+
+const DEFAULT_TEXT_AI_IMAGE_PROMPT_TAGS_TEMPLATE = `{{qig_timestamp_prefix}}### STANDALONE IMAGE GENERATION TASK ###{{qig_skin_enforce}}
+
+CRITICAL - THIS IS NOT A CONTINUATION OF CHAT:
+- IGNORE any ambient chat history outside the selected scene below
+- Generate a FRESH image prompt based ONLY on the selected scene below
+- DO NOT repeat or paraphrase the scene text verbatim
+- This is a standalone generation task
+{{qig_multi_message_context_block}}
+
+### OUTPUT FORMAT (MANDATORY) ###
+Output ONLY comma-separated Danbooru/Booru-style tags. No sentences. No descriptions. No paragraphs. No prose. No explanations.
+If you write a sentence instead of tags, you have FAILED the task.
+
+CORRECT example output:
+1girl, hatsune_miku, vocaloid, long_hair, twintails, blue_hair, blue_eyes, detached_sleeves, thighhighs, sitting, smile, looking_at_viewer, classroom, window, sunlight, masterpiece, best_quality
+
+WRONG (DO NOT do this):
+"A girl with long blue twintails sits in a classroom by the window, smiling at the viewer."
+
+### IMAGE GENERATION TASK ###
+
+{{qig_tags_scene_line}}
+
+Character info: {{qig_appearance_context}}{{qig_exact_name_block}}{{qig_user_name_block}}{{qig_identity_requirement_block}}{{qig_subject_priority_block}}
+
+Required tag categories:
+- Character name + series name (CRITICAL: Use recognizable fictional media character tags whenever recognized{{qig_tags_exact_name_clause}})
+{{qig_user_scene_requirement_bullet}}
+- Preserve explicit ages, species, creature types, and nonhuman identities from the scene/profile instead of replacing them with generic human tags
+- Physical traits (hair, eyes, body, skin)
+- Clothing and accessories
+- Pose and expression
+- Background/setting
+- Quality tags (masterpiece, best quality, etc.){{qig_tags_enhancement_section}}
+{{qig_tags_restrictions}}
+
+Tags:{{qig_output_ref_suffix}}{{qig_prefill_hint}}`;
+
+const DEFAULT_TEXT_AI_IMAGE_PROMPT_CUSTOM_TEMPLATE = `{{qig_timestamp_prefix}}{{qig_custom_instruction_with_entropy}}{{qig_prefill_hint}}`;
+
+const DEFAULT_TEXT_AI_SCENE_DESCRIPTION_TEMPLATE = `{{qig_timestamp_prefix}}[STANDALONE VISUAL SCENE DESCRIPTION TASK]
+
+Convert the selected chat scene into one concise plain-language visual description for an image generator.
+
+Rules:
+- Output ONLY the plain description. No commentary, no markdown, no speaker labels, no tags, no bullet list.
+- Describe one coherent visible moment: subjects, identities, poses, expressions, clothing, setting, lighting, mood, and camera framing.
+- Preserve explicit species, ages, body traits, names, and non-human details from the scene or reference context.
+- Do not continue the roleplay and do not quote dialogue.
+{{qig_scene_description_multi_message_rule}}{{qig_reference_block}}
+
+SELECTED SCENE{{qig_scene_description_context_suffix}}:
+{{qig_scene}}
+
+Plain visual description:{{qig_request_marker_suffix}}`;
+
+const LEGACY_TEXT_AI_SCENE_DESCRIPTION_CUSTOM_TEMPLATE = `{{qig_timestamp_prefix}}{{qig_custom_scene_instruction_resolved}}{{qig_custom_scene_append}}{{qig_request_marker_suffix}}`;
+
+function migrateLegacyTwoStepInstructionToSceneTemplate(instruction) {
+    const source = String(instruction || "").trim();
+    if (!source) return null;
+    const hasSceneMacro = /\{\{\s*scene\s*\}\}/i.test(source);
+    let migrated = source
+        .replace(/\{\{\s*scene\s*\}\}/gi, "{{qig_scene}}")
+        .replace(/\{\{\s*charDesc\s*\}\}/gi, "{{qig_character_description}}")
+        .replace(/\{\{\s*userDesc\s*\}\}/gi, "{{qig_user_persona}}")
+        .replace(/\{\{\s*char\s*\}\}/gi, "{{qig_character_name}}")
+        .replace(/\{\{\s*user\s*\}\}/gi, "{{qig_user_name}}");
+    if (!hasSceneMacro) {
+        migrated += `
+
+SELECTED SCENE{{qig_scene_description_context_suffix}}:
+{{qig_scene}}`;
+    }
+    return `{{qig_timestamp_prefix}}${migrated}{{qig_request_marker_suffix}}`;
+}
+
+const DEFAULT_TEXT_AI_MISSING_TAG_TEMPLATE = `{{qig_inject_instruction}}
+
+Based on this scene context, generate exactly one image tag for the single best visual moment. You must use the exact tag format shown above. Return exactly one tag only. Do not generate multiple tags, lists, moments, or variants.
+
+Scene context:
+{{qig_scene}}
+
+Respond with image tags only.
+
+[{{qig_timestamp}}]`;
+
+const DEFAULT_IMAGE_PROVIDER_POSITIVE_TEMPLATE = `{{qig_st_positive_prefix}}{{qig_quality_prefix}}{{qig_style_prefix}}{{qig_image_prompt}}{{qig_style_suffix}}{{qig_st_positive_suffix}}`;
+
+const DEFAULT_IMAGE_PROVIDER_NEGATIVE_TEMPLATE = `{{qig_st_negative_prefix}}{{qig_negative_prompt}}{{qig_st_negative_suffix}}`;
+
+function getDefaultQigApiTemplate(settings, key) {
+    if (key === "textAiImagePromptTemplate") {
+        if (settings?.llmPromptStyle === "natural") return DEFAULT_TEXT_AI_IMAGE_PROMPT_NATURAL_TEMPLATE;
+        if (settings?.llmPromptStyle === "custom" && String(settings?.llmCustomInstruction || "").trim()) {
+            return DEFAULT_TEXT_AI_IMAGE_PROMPT_CUSTOM_TEMPLATE;
+        }
+        return DEFAULT_TEXT_AI_IMAGE_PROMPT_TAGS_TEMPLATE;
+    }
+    if (key === "textAiSceneDescriptionTemplate") return DEFAULT_TEXT_AI_SCENE_DESCRIPTION_TEMPLATE;
+    if (key === "textAiMissingTagTemplate") return DEFAULT_TEXT_AI_MISSING_TAG_TEMPLATE;
+    if (key === "imageProviderPositiveTemplate") return DEFAULT_IMAGE_PROVIDER_POSITIVE_TEMPLATE;
+    if (key === "imageProviderNegativeTemplate") return DEFAULT_IMAGE_PROVIDER_NEGATIVE_TEMPLATE;
+    return "";
+}
+
 const defaultSettings = {
     provider: "pollinations",
     style: "none",
@@ -869,6 +1126,16 @@ const defaultSettings = {
     llmAddLighting: false,
     llmAddArtist: false,
     llmPrefill: "",
+    textAiImagePromptTemplate: null,
+    textAiSceneDescriptionTemplate: null,
+    textAiMissingTagTemplate: null,
+    imageProviderPositiveTemplate: null,
+    imageProviderNegativeTemplate: null,
+    stylePrefixOverride: null,
+    styleSuffixOverride: null,
+    macroInspectorLastGenerationValues: {},
+    macroInspectorLastGenerationAt: 0,
+    macroTextSources: {},
     messageRange: "-1",
     width: 512,
     height: 512,
@@ -885,7 +1152,6 @@ const defaultSettings = {
     contextMediaConfidence: CONTEXT_MEDIA_CONFIDENCE_DEFAULT,
     contextMediaInsertMode: "replace",
     twoStepPrompt: false,
-    twoStepInstruction: "",
     autoSetBackground: false,
     backgroundMode: "temporary",
     autoInsert: false,
@@ -3442,6 +3708,7 @@ function beginGeneration({ settings = getGenerationSettingsForRun(), context = g
     cancelRequested = false;
     isGenerating = true;
     currentAbortController = run.controller;
+    resetQigLastGenerationMacroValues();
     setGenerationActiveUI(true, { disableGenerateButton });
     return run;
 }
@@ -3456,6 +3723,7 @@ function endGeneration(run, { disableGenerateButton = false } = {}) {
     paletteCancelLockUntil = 0;
     showStatus(null);
     setGenerationActiveUI(false, { disableGenerateButton });
+    refreshQigMacroInspector();
     return true;
 }
 
@@ -3758,6 +4026,39 @@ async function loadSettings() {
     const normalizedSaved = normalizeComfyIntegrationSettings(saved || {});
     extension_settings[extensionName] = { ...defaultSettings, ...normalizedSaved };
     const s = extension_settings[extensionName];
+    // Discard the opaque whole-request placeholders used by earlier experimental builds.
+    // Null means: use the full visible default template selected for the current settings.
+    if (s.textAiImagePromptTemplate === "{{qig_generated_request}}") s.textAiImagePromptTemplate = null;
+    if (s.textAiSceneDescriptionTemplate === "{{qig_generated_request}}") s.textAiSceneDescriptionTemplate = null;
+    const legacyTwoStepInstruction = typeof saved?.twoStepInstruction === "string"
+        ? saved.twoStepInstruction.trim()
+        : "";
+    const savedSceneDescriptionTemplate = saved?.textAiSceneDescriptionTemplate;
+    if (legacyTwoStepInstruction
+        && (savedSceneDescriptionTemplate == null
+            || savedSceneDescriptionTemplate === LEGACY_TEXT_AI_SCENE_DESCRIPTION_CUSTOM_TEMPLATE)) {
+        s.textAiSceneDescriptionTemplate = migrateLegacyTwoStepInstructionToSceneTemplate(legacyTwoStepInstruction);
+    } else if (s.textAiSceneDescriptionTemplate === LEGACY_TEXT_AI_SCENE_DESCRIPTION_CUSTOM_TEMPLATE) {
+        s.textAiSceneDescriptionTemplate = null;
+    }
+    delete s.twoStepInstruction;
+    if (s.imageProviderPositiveTemplate === "{{qig_final_positive}}") s.imageProviderPositiveTemplate = null;
+    if (s.imageProviderNegativeTemplate === "{{qig_final_negative}}") s.imageProviderNegativeTemplate = null;
+    if (!s.macroInspectorLastGenerationValues || typeof s.macroInspectorLastGenerationValues !== "object" || Array.isArray(s.macroInspectorLastGenerationValues)) {
+        s.macroInspectorLastGenerationValues = {};
+    }
+    s.macroInspectorLastGenerationAt = Number.isFinite(Number(s.macroInspectorLastGenerationAt))
+        ? Number(s.macroInspectorLastGenerationAt)
+        : 0;
+    if (!s.macroTextSources || typeof s.macroTextSources !== "object" || Array.isArray(s.macroTextSources)) {
+        s.macroTextSources = {};
+    }
+    // Discard the rejected V7 post-resolution layer; V8 source fields are the only QIG-owned wording source.
+    const rejectedV7MacroSettingKey = ["macroText", "Overrides"].join("");
+    delete s[rejectedV7MacroSettingKey];
+    for (const key of ["textAiImagePromptTemplate", "textAiSceneDescriptionTemplate", "imageProviderPositiveTemplate", "imageProviderNegativeTemplate"]) {
+        if (typeof s[key] === "string" && /\{\{\s*qig_(?:apply|prepend|append|expand)_/i.test(s[key])) s[key] = null;
+    }
     const comfyModelLoaderNeedsMigration = !!saved
         && (saved.comfyModelLoader !== normalizedSaved.comfyModelLoader
             || saved.comfyFluxVaeModel !== normalizedSaved.comfyFluxVaeModel
@@ -3778,7 +4079,6 @@ async function loadSettings() {
     normalizeAutoGenerateSettings(s);
     normalizeContextMediaSettings(s);
     s.backgroundMode = normalizeBackgroundMode(s.backgroundMode);
-    if (typeof s.twoStepInstruction !== "string") s.twoStepInstruction = "";
     // Migrate generated inject defaults to the current tag-aware defaults while preserving custom overrides.
     if (saved && isGeneratedInjectRegex(saved.injectRegex, savedTagName)) {
         s.injectRegex = buildDefaultInjectRegex(savedTagName);
@@ -4997,6 +5297,979 @@ function enrichSceneTextForFilters(sceneText, label = "Contextual filters") {
     return enriched;
 }
 
+function normalizeQigTemplateValues(values = {}) {
+    return Object.fromEntries(
+        Object.entries(values || {}).map(([key, value]) => [String(key).toLowerCase(), String(value ?? "")])
+    );
+}
+
+function resetQigLastGenerationMacroValues() {
+    const settings = extension_settings?.[extensionName];
+    if (!settings) return;
+    settings.macroInspectorLastGenerationValues = {};
+    settings.macroInspectorLastGenerationAt = Date.now();
+    saveSettingsDebounced?.();
+}
+
+function recordQigLastGenerationMacroValues(values = {}) {
+    const settings = extension_settings?.[extensionName];
+    if (!settings) return;
+    const existing = settings.macroInspectorLastGenerationValues;
+    const target = existing && typeof existing === "object" && !Array.isArray(existing)
+        ? existing
+        : {};
+    Object.assign(target, normalizeQigTemplateValues(values));
+    settings.macroInspectorLastGenerationValues = target;
+    settings.macroInspectorLastGenerationAt = Date.now();
+    saveSettingsDebounced?.();
+}
+
+function getQigLastGenerationMacroValues(settings = getSettings()) {
+    const values = settings?.macroInspectorLastGenerationValues;
+    return values && typeof values === "object" && !Array.isArray(values) ? values : {};
+}
+
+// QIG-owned macro wording lives in these editable source-text fields.
+// Source-text fields may contain other listed {{qig_*}} macros. Nested macros are resolved only when a request is assembled.
+// Conditions decide whether a macro is active, but the inserted wording always comes from its single Text field.
+const QIG_MACRO_SOURCE_DEFINITIONS = Object.freeze({
+    qig_appearance_context: {
+        defaultText: `<<IF current_card_char_desc>>{{qig_character_name}}'s appearance: {{qig_character_description}}
+<<END>><<IF current_card_user_persona>>{{qig_user_name}}'s appearance: {{qig_user_persona}}
+<<END>><<IF current_card_tags>>Source/Tags: {{qig_character_tags}}
+<<END>><<IF current_card_scenario>>Setting: {{qig_scenario}}
+<<END>><<IF prompt_user_persona_first>>User persona ({{qig_user_name}}; applies to first-person references like I/me/my): {{qig_user_persona}}
+<<END>><<IF prompt_char_desc_primary>>Character profiles:
+{{qig_character_description}}
+<<END>><<IF prompt_char_desc_secondary>>Secondary active character profiles (only use if the scene clearly includes them):
+{{qig_character_description}}
+<<END>><<IF prompt_user_persona_after>>User persona ({{qig_user_name}}; applies to first-person references like I/me/my): {{qig_user_persona}}
+<<END>><<IF prompt_tags>>Source/Tags: {{qig_character_tags}}
+<<END>><<IF prompt_scenario>>Setting: {{qig_scenario}}
+<<END>>`,
+    },
+    qig_reference_block: {
+        defaultText: `
+REFERENCE CONTEXT:<<IF reference_char_desc>>
+{{qig_character_name}}'s appearance/profile: {{qig_character_description}}<<END>><<IF reference_user_persona>>
+{{qig_user_name}}'s persona/appearance: {{qig_user_persona}}<<END>><<IF reference_tags>>
+Source/Tags: {{qig_character_tags}}<<END>><<IF reference_scenario>>
+Setting: {{qig_scenario}}<<END>><<IF reference_active_names>>
+Active character names to preserve when visible: {{qig_active_character_list}}<<END>>`,
+    },
+    qig_quality_prefix: {
+        defaultText: `{{qig_quality_tags}}, `,
+    },
+    qig_custom_scene_append: {
+        defaultText: `<<IF single_message>>
+
+SELECTED SCENE:
+{{qig_scene}}<<END>><<IF multi_message>>
+
+SELECTED SCENE CONTEXT:
+{{qig_scene}}<<END>>`,
+    },
+    qig_skin_enforce: {
+        defaultText: `
+CRITICAL - You MUST include these skin tones: {{qig_skin_tones}}`,
+    },
+    qig_multi_message_context_block: {
+        defaultText: `
+MULTI-MESSAGE SCENE CONTEXT:
+- The selected scene below is speaker-tagged context from the chosen chat messages.
+- Use it to infer one coherent visual moment.
+- Do NOT copy speaker labels, quote dialogue, or echo transcript lines in the output.
+- Convert the exchange into visual details only: subjects, actions, expressions, setting, camera framing, lighting, and mood.`,
+    },
+    qig_exact_name_block: {
+        defaultText: `<<IF exact_names_preserve>>
+CHARACTER NAMES TO PRESERVE (use these exact spellings when applicable): {{qig_active_character_list}}<<END>><<IF exact_names_deprioritized>>
+ACTIVE CHARACTER NAMES (only use if the scene explicitly includes them): {{qig_active_character_list}}<<END>>`,
+    },
+    qig_user_name_block: {
+        defaultText: `
+USER PERSONA NAME (use when the scene refers to the user / I / me / my): {{qig_user_name}}`,
+    },
+    qig_identity_requirement_block: {
+        defaultText: `
+IDENTITY REQUIREMENTS:
+- Preserve any explicit age, age range, species, creature type, race, or persona/body traits from the scene or profile.
+- Do NOT flatten specific identities into generic labels like man, woman, person, human, teen, adult, boy, or girl when more specific information is available.
+- If a subject is non-human or from a known fantasy/franchise species, keep that identity in the prompt instead of humanizing it.<<IF has_user_persona>>
+- If the scene uses first-person references like I/me/my or mentions {{qig_user_name}}, that subject is the user persona described below. Use that persona's age, species, body type, and nonhuman traits.<<END>>`,
+    },
+    qig_subject_priority_block: {
+        defaultText: `
+SCENE SUBJECT PRIORITY:<<IF scene_includes_user_persona>>
+- The user persona ({{qig_user_name}}) is visually involved in this scene whenever the scene uses first-person references or the user name.
+- Do NOT replace the user persona with a generic human label or with the active chat character's profile.
+- If the user persona is acting in the scene, depict them as a full subject when relevant instead of reducing them to a hand, claw, limb, silhouette, or other partial-body placeholder unless the scene explicitly calls for an off-screen POV framing.<<END>><<IF user_likely_primary_subject>>
+- Reflection/self-view scenes should treat the user persona ({{qig_user_name}}) as the primary visual subject and describe their full appearance.<<END>><<IF deprioritize_unmentioned_characters>>
+- Do not center the active chat character or inject their full profile unless the scene clearly includes them.<<END>><<IF user_and_named_character>>
+- If both the user persona and another subject are present, preserve both identities accurately and do not let {{qig_mentioned_character_list}} overshadow the user persona.<<END>>`,
+    },
+    qig_natural_scene_line: {
+        defaultText: `<<IF single_message>>CURRENT SCENE: {{qig_request_marker}} {{qig_scene}}<<END>><<IF multi_message>>SCENE CONTEXT (multiple messages):
+{{qig_scene}}<<END>>`,
+    },
+    qig_natural_exact_name_bullet: {
+        defaultText: `- Use the exact active character names when the scene/card identifies them ({{qig_active_character_list}})`,
+    },
+    qig_user_scene_requirement_bullet: {
+        defaultText: `
+- If the scene refers to the user in first person or by name, use the user persona reference below for that subject ({{qig_user_name}})`,
+    },
+    qig_natural_enhancement_section: {
+        defaultText: `
+
+YOU MUST ALSO INCLUDE:<<IF add_quality>>
+- Enhanced quality descriptors (masterpiece, highly detailed, sharp focus, etc.)<<END>><<IF add_lighting>>
+- Professional lighting descriptions (dramatic lighting, soft lighting, rim lighting, etc.)<<END>><<IF add_artist>>
+- Art style references from well-known artists (e.g., {{qig_natural_artist}}, etc.)<<END>>`,
+    },
+    qig_natural_restrictions: {
+        defaultText: `
+- DO NOT include artist names or art style references`,
+    },
+    qig_tags_scene_line: {
+        defaultText: `<<IF single_message>>Create Danbooru/Booru-style tags for this scene: {{qig_request_marker}} {{qig_scene}}<<END>><<IF multi_message>>Create Danbooru/Booru-style tags for this scene context:
+{{qig_scene}}<<END>>`,
+    },
+    qig_tags_exact_name_clause: {
+        defaultText: `, and keep exact active names like {{qig_active_character_list}} when no canonical tag exists`,
+    },
+    qig_tags_enhancement_section: {
+        defaultText: `
+
+MUST INCLUDE these additional elements:<<IF add_quality>>
+- Enhanced quality tags (masterpiece, best quality, highly detailed, sharp focus, etc.)<<END>><<IF add_lighting>>
+- Professional lighting descriptions (dramatic lighting, soft lighting, rim lighting, etc.)<<END>><<IF add_artist>>
+- Include artist tags from anime/manga artists (e.g., {{qig_tags_artist}}, etc.)<<END>>`,
+    },
+    qig_tags_restrictions: {
+        defaultText: `
+CRITICAL RESTRICTIONS (MUST FOLLOW):
+- NEVER use realistic style tags (e.g., realistic, photorealistic, hyperrealistic, photography, etc.)
+- NEVER use realistic artists (e.g., wlop, artgerm, rossdraws, etc.)
+- NEVER use common/overused artists (e.g., sakimichan, greg rutkowski, alphonse mucha, etc.)<<IF no_artist>>
+- DO NOT include any artist names<<END>>`,
+    },
+    qig_scene_description_context_suffix: {
+        defaultText: ` CONTEXT`,
+    },
+    qig_scene_description_multi_message_rule: {
+        defaultText: `- The selected scene is a multi-message transcript. Infer the best single visual moment from it.`,
+    },
+    qig_custom_enhancement_section: {
+        defaultText: `
+
+ADDITIONAL REQUIREMENTS:<<IF add_quality>>
+- Include quality tags (masterpiece, best quality, highly detailed, sharp focus, etc.)<<END>><<IF add_lighting>>
+- Include lighting descriptions (dramatic lighting, soft lighting, rim lighting, etc.)<<END>><<IF add_artist>>
+- Include artist tags (e.g., {{qig_custom_artist}}, etc.)<<END>>`,
+    },
+    qig_custom_name_requirements: {
+        defaultText: `
+
+NAME REQUIREMENTS:<<IF exact_names_preserve>>
+- Preserve and include these exact character name{{qig_character_name_plural_suffix}} when the scene/card identifies them: {{qig_active_character_list}}<<END>><<IF exact_names_deprioritized>>
+- Preserve and include these exact character name{{qig_character_name_plural_suffix}} when the scene/card identifies them; otherwise do not force them into the prompt just because they are the active chat character: {{qig_active_character_list}}<<END>><<IF has_user_persona>>
+- If the scene refers to the user in first person or by name, preserve and include the exact user persona name when applicable: {{qig_user_name}}<<END>>`,
+    },
+    qig_custom_instruction_with_entropy: {
+        defaultText: `{{qig_custom_instruction_resolved}}{{qig_custom_enhancement_section}}{{qig_skin_enforce}}{{qig_identity_requirement_block}}{{qig_subject_priority_block}}{{qig_custom_name_requirements}}{{qig_custom_scene_append}}`,
+    },
+    qig_prefill_hint: {
+        defaultText: `
+
+Continue the output from this exact prefix if your backend supports prefills:
+{{qig_prefill}}`,
+    },
+    qig_request_id: {
+        defaultText: `{{qig_timestamp}}_{{qig_random}}`,
+    },
+    qig_request_marker: {
+        defaultText: `{{{{qig_request_id}}}}`,
+    },
+    qig_timestamp_prefix: {
+        defaultText: `[{{qig_timestamp}}]
+`,
+    },
+    qig_output_ref_suffix: {
+        defaultText: ` [ref:{{qig_random}}]`,
+    },
+    qig_request_marker_suffix: {
+        defaultText: `
+
+Request marker: {{qig_request_marker}}`,
+    },
+});
+
+const QIG_SOURCE_TEXT_MACROS = Object.freeze(new Set(Object.keys(QIG_MACRO_SOURCE_DEFINITIONS)));
+
+const QIG_LEGACY_SOURCE_TOKEN_TO_MACRO = Object.freeze({
+    active_character_list: "qig_active_character_list",
+    char_desc: "qig_character_description",
+    char_name: "qig_character_name",
+    character_name_plural_suffix: "qig_character_name_plural_suffix",
+    custom_artist: "qig_custom_artist",
+    custom_enhancement_section: "qig_custom_enhancement_section",
+    custom_instruction_resolved: "qig_custom_instruction_resolved",
+    custom_name_requirements: "qig_custom_name_requirements",
+    custom_scene_append: "qig_custom_scene_append",
+    identity_requirement_block: "qig_identity_requirement_block",
+    mentioned_character_list: "qig_mentioned_character_list",
+    natural_artist: "qig_natural_artist",
+    prefill: "qig_prefill",
+    quality_tags: "qig_quality_tags",
+    random: "qig_random",
+    request_id: "qig_request_id",
+    request_marker: "qig_request_marker",
+    scenario: "qig_scenario",
+    scene: "qig_scene",
+    skin_enforce: "qig_skin_enforce",
+    skin_tones: "qig_skin_tones",
+    subject_priority_block: "qig_subject_priority_block",
+    tags: "qig_character_tags",
+    tags_artist: "qig_tags_artist",
+    timestamp: "qig_timestamp",
+    user_name: "qig_user_name",
+    user_persona: "qig_user_persona",
+});
+
+function migrateQigMacroSourceTextToNestedMacros(sourceText) {
+    return String(sourceText ?? "").replace(/<<([a-z0-9_]+)>>/gi, (match, legacyName) => {
+        const macroName = QIG_LEGACY_SOURCE_TOKEN_TO_MACRO[String(legacyName || "").toLowerCase()];
+        return macroName ? `{{${macroName}}}` : match;
+    });
+}
+
+function getQigMacroTextSources(settings = getSettings()) {
+    const sources = settings?.macroTextSources;
+    return sources && typeof sources === "object" && !Array.isArray(sources) ? sources : {};
+}
+
+function getQigMacroSourceText(settings, macroName) {
+    const key = String(macroName || "").toLowerCase();
+    const definition = QIG_MACRO_SOURCE_DEFINITIONS[key];
+    if (!definition) return "";
+    const sources = getQigMacroTextSources(settings);
+    const sourceText = Object.prototype.hasOwnProperty.call(sources, key)
+        ? String(sources[key] ?? "")
+        : String(definition.defaultText ?? "");
+    return migrateQigMacroSourceTextToNestedMacros(sourceText);
+}
+
+function hasSavedQigMacroSources(settings = getSettings(), macroNames = null) {
+    const sources = getQigMacroTextSources(settings);
+    const keys = macroNames ? Array.from(macroNames, name => String(name || "").toLowerCase()) : Object.keys(sources);
+    return keys.some(key => Object.prototype.hasOwnProperty.call(sources, key));
+}
+
+function renderQigMacroSourceTemplate(sourceText, conditions = {}) {
+    const normalized = Object.fromEntries(
+        Object.entries(conditions || {}).map(([key, value]) => [String(key).toLowerCase(), value])
+    );
+    let output = String(sourceText ?? "");
+    output = output.replace(/<<IF\s+([a-z0-9_]+)>>([\s\S]*?)<<END>>/gi, (_match, conditionName, body) => {
+        return normalized[String(conditionName || "").toLowerCase()] ? body : "";
+    });
+    return output;
+}
+
+function resolveQigMacroSource(macroName, conditions = {}, settings = getSettings(), active = true) {
+    if (!active) return "";
+    return renderQigMacroSourceTemplate(getQigMacroSourceText(settings, macroName), conditions);
+}
+
+function applyQigCustomInstructionMetadata(source, requestMarker, outputRefSuffix) {
+    return String(source ?? "")
+        .replace(/(CURRENT SCENE:|Scene:|scene:)/i, `$1 ${String(requestMarker || "")}`)
+        .replace(/(Tags:|Prompt:)\s*$/m, `$1${String(outputRefSuffix || "")}`);
+}
+
+function buildQigSourceDrivenMacroValues(settings = getSettings(), context = {}) {
+    const s = settings || {};
+    const scene = String(context.scene ?? "");
+    const charName = String(context.charName || "character");
+    const userName = String(context.userName || "user");
+    const charDesc = String(context.charDesc || "");
+    const userPersona = String(context.userPersona || "");
+    const tags = String(context.tags || "");
+    const scenario = String(context.scenario || "");
+    const activeCharacterNames = uniqueStringList(context.activeCharacterNames || []);
+    const activeCharacterList = activeCharacterNames.join(", ");
+    const sceneMentionedCharacterNames = uniqueStringList(context.sceneMentionedCharacterNames || []);
+    const mentionedCharacterList = sceneMentionedCharacterNames.join(", ");
+    const usesCurrentCardContext = context.usesCurrentCardContext === true;
+    const sceneIncludesUserPersona = context.sceneIncludesUserPersona === true;
+    const shouldDeprioritizeUnmentionedCharacters = context.shouldDeprioritizeUnmentionedCharacters === true;
+    const userLikelyPrimarySubject = context.userLikelyPrimarySubject === true;
+    const isMultiMessage = context.isMultiMessage === true;
+    const shouldUseExactNameRequirements = context.shouldUseExactNameRequirements === true;
+    const skinTones = Array.isArray(context.skinTones) ? context.skinTones.filter(Boolean) : [];
+    const timestamp = String(context.timestamp ?? "");
+    const randomPart = String(context.randomPart ?? "");
+    const resolvedPrefill = String(context.resolvedPrefill ?? "");
+    const customInstructionResolved = String(context.customInstructionResolved ?? "");
+    const customSceneNeedsAppend = context.customSceneNeedsAppend === true;
+    const addQuality = s.llmAddQuality === true;
+    const addLighting = s.llmAddLighting === true;
+    const addArtist = s.llmAddArtist === true;
+    const providerAlreadyFinal = context.providerAlreadyFinal === true;
+
+    const conditions = {
+        current_card_char_desc: usesCurrentCardContext && !!charDesc,
+        current_card_user_persona: usesCurrentCardContext && !!userPersona,
+        current_card_tags: usesCurrentCardContext && !!tags,
+        current_card_scenario: usesCurrentCardContext && !!scenario,
+        prompt_user_persona_first: !usesCurrentCardContext && sceneIncludesUserPersona && !!userPersona,
+        prompt_char_desc_primary: !usesCurrentCardContext && !!charDesc && !shouldDeprioritizeUnmentionedCharacters,
+        prompt_char_desc_secondary: !usesCurrentCardContext && !!charDesc && shouldDeprioritizeUnmentionedCharacters,
+        prompt_user_persona_after: !usesCurrentCardContext && !sceneIncludesUserPersona && !!userPersona,
+        prompt_tags: !usesCurrentCardContext && !!tags,
+        prompt_scenario: !usesCurrentCardContext && !!scenario,
+        reference_char_desc: !!charDesc,
+        reference_user_persona: !!userPersona,
+        reference_tags: !!tags,
+        reference_scenario: !!scenario,
+        reference_active_names: !!activeCharacterList,
+        exact_names_preserve: shouldUseExactNameRequirements && !shouldDeprioritizeUnmentionedCharacters,
+        exact_names_deprioritized: shouldUseExactNameRequirements && shouldDeprioritizeUnmentionedCharacters,
+        has_user_persona: !!userPersona,
+        scene_includes_user_persona: sceneIncludesUserPersona,
+        user_likely_primary_subject: userLikelyPrimarySubject,
+        deprioritize_unmentioned_characters: shouldDeprioritizeUnmentionedCharacters,
+        user_and_named_character: sceneIncludesUserPersona && sceneMentionedCharacterNames.length > 0,
+        single_message: !isMultiMessage,
+        multi_message: isMultiMessage,
+        add_quality: addQuality,
+        add_lighting: addLighting,
+        add_artist: addArtist,
+        no_artist: !addArtist,
+    };
+
+    const hasAppearanceContext = !!(charDesc || userPersona || tags || scenario);
+    const hasReferenceContext = !!(charDesc || userPersona || tags || scenario || activeCharacterList.length);
+    const hasSubjectPriority = sceneIncludesUserPersona || userLikelyPrimarySubject || shouldDeprioritizeUnmentionedCharacters
+        || (sceneIncludesUserPersona && sceneMentionedCharacterNames.length > 0);
+    const hasEnhancements = addQuality || addLighting || addArtist;
+
+    const rawValues = normalizeQigTemplateValues({
+        qig_st_positive_prefix: String(context.stPositivePrefix || ""),
+        qig_st_positive_suffix: String(context.stPositiveSuffix || ""),
+        qig_st_negative_prefix: String(context.stNegativePrefix || ""),
+        qig_st_negative_suffix: String(context.stNegativeSuffix || ""),
+        qig_scene: scene,
+        qig_character_name: charName,
+        qig_user_name: userName,
+        qig_character_description: charDesc,
+        qig_user_persona: userPersona,
+        qig_character_tags: tags,
+        qig_scenario: scenario,
+        qig_active_character_list: activeCharacterList,
+        qig_mentioned_character_list: mentionedCharacterList,
+        qig_skin_tones: skinTones.join(", "),
+        qig_character_name_plural_suffix: activeCharacterNames.length === 1 ? "" : "s",
+        qig_natural_artist: String(context.naturalArtist || ""),
+        qig_tags_artist: String(context.tagsArtist || ""),
+        qig_custom_artist: String(context.customArtist || ""),
+        qig_negative_prompt: String(context.negativePrompt ?? s.negativePrompt ?? ""),
+        qig_quality_tags: String(s.qualityTags || ""),
+        qig_style_prefix: providerAlreadyFinal ? "" : getQigStyleText(s, "prefix"),
+        qig_style_suffix: providerAlreadyFinal ? "" : getQigStyleText(s, "suffix"),
+        qig_inject_instruction: String(context.injectInstruction ?? ""),
+        qig_prefill: resolvedPrefill,
+        qig_custom_instruction_resolved: customInstructionResolved,
+        qig_image_prompt: String(context.imagePrompt ?? ""),
+        qig_timestamp: timestamp,
+        qig_random: randomPart,
+    });
+
+    const active = {
+        qig_appearance_context: hasAppearanceContext,
+        qig_reference_block: hasReferenceContext,
+        qig_quality_prefix: !providerAlreadyFinal && !!(s.appendQuality && s.qualityTags),
+        qig_custom_scene_append: customSceneNeedsAppend,
+        qig_skin_enforce: skinTones.length > 0,
+        qig_multi_message_context_block: isMultiMessage,
+        qig_exact_name_block: shouldUseExactNameRequirements,
+        qig_user_name_block: !!userPersona,
+        qig_identity_requirement_block: true,
+        qig_subject_priority_block: hasSubjectPriority,
+        qig_natural_scene_line: true,
+        qig_natural_exact_name_bullet: shouldUseExactNameRequirements,
+        qig_user_scene_requirement_bullet: !!userPersona,
+        qig_natural_enhancement_section: hasEnhancements,
+        qig_natural_restrictions: !addArtist,
+        qig_tags_scene_line: true,
+        qig_tags_exact_name_clause: shouldUseExactNameRequirements,
+        qig_tags_enhancement_section: hasEnhancements,
+        qig_tags_restrictions: true,
+        qig_scene_description_context_suffix: isMultiMessage,
+        qig_scene_description_multi_message_rule: isMultiMessage,
+        qig_custom_enhancement_section: hasEnhancements,
+        qig_custom_name_requirements: shouldUseExactNameRequirements || !!userPersona,
+        qig_custom_instruction_with_entropy: !!customInstructionResolved,
+        qig_prefill_hint: !!resolvedPrefill,
+        qig_request_id: !!(timestamp || randomPart),
+        qig_request_marker: !!(timestamp || randomPart),
+        qig_timestamp_prefix: !!timestamp,
+        qig_output_ref_suffix: !!randomPart,
+        qig_request_marker_suffix: !!(timestamp || randomPart),
+    };
+
+    const cache = {};
+    const resolving = new Set();
+    const macroPattern = /\{\{\s*(qig_[a-z0-9_]+)\s*\}\}/gi;
+
+    const resolveMacro = (macroName) => {
+        const key = String(macroName || "").toLowerCase();
+        if (Object.prototype.hasOwnProperty.call(cache, key)) return cache[key];
+        if (Object.prototype.hasOwnProperty.call(rawValues, key)) {
+            cache[key] = String(rawValues[key] ?? "");
+            return cache[key];
+        }
+        const definition = QIG_MACRO_SOURCE_DEFINITIONS[key];
+        if (!definition) return `{{${key}}}`;
+        if (active[key] === false) {
+            cache[key] = "";
+            return "";
+        }
+        if (resolving.has(key)) {
+            log(`Nested macro cycle detected at {{${key}}}`);
+            return `{{${key}}}`;
+        }
+
+        resolving.add(key);
+        let result = renderQigMacroSourceTemplate(getQigMacroSourceText(s, key), conditions);
+        result = result.replace(macroPattern, (match, nestedName) => {
+            const nestedKey = String(nestedName || "").toLowerCase();
+            if (!Object.prototype.hasOwnProperty.call(rawValues, nestedKey)
+                && !Object.prototype.hasOwnProperty.call(QIG_MACRO_SOURCE_DEFINITIONS, nestedKey)) {
+                return match;
+            }
+            return resolveMacro(nestedKey);
+        });
+        resolving.delete(key);
+
+        if (key === "qig_custom_instruction_with_entropy" && result) {
+            result = applyQigCustomInstructionMetadata(
+                result,
+                resolveMacro("qig_request_marker"),
+                resolveMacro("qig_output_ref_suffix"),
+            );
+        }
+        cache[key] = result;
+        return result;
+    };
+
+    const allNames = new Set([
+        ...Object.keys(rawValues),
+        ...Object.keys(QIG_MACRO_SOURCE_DEFINITIONS),
+    ]);
+    for (const name of allNames) resolveMacro(name);
+    return normalizeQigTemplateValues(cache);
+}
+
+function resolveQigApiTextTemplate(template, values = {}) {
+    const source = String(template ?? "");
+    const normalizedValues = normalizeQigTemplateValues(values);
+    if (isGenerating || activeGenerationRun) recordQigLastGenerationMacroValues(normalizedValues);
+    return source.replace(/\{\{\s*(qig_[a-z0-9_]+)\s*\}\}/gi, (match, macroName) => {
+        const key = String(macroName || "").toLowerCase();
+        return Object.prototype.hasOwnProperty.call(normalizedValues, key) ? normalizedValues[key] : match;
+    });
+}
+
+function getQigApiTemplateSettingValue(settings, key) {
+    if (settings && Object.prototype.hasOwnProperty.call(settings, key)) return settings[key];
+    return extension_settings?.[extensionName]?.[key];
+}
+
+function isDefaultQigApiTemplate(settings, key) {
+    return typeof getQigApiTemplateSettingValue(settings, key) !== "string";
+}
+
+function getQigApiTemplate(settings, key) {
+    const liveSettings = extension_settings?.[extensionName];
+    const value = getQigApiTemplateSettingValue(settings, key);
+    const defaultSource = settings || liveSettings || {};
+    return typeof value === "string" ? value : getDefaultQigApiTemplate(defaultSource, key);
+}
+
+function resetQigApiTemplateField(settingKey, fieldId) {
+    const settings = getSettings();
+    settings[settingKey] = null;
+    const defaultValue = getDefaultQigApiTemplate(settings, settingKey);
+    const field = document.getElementById(fieldId);
+    if (field) field.value = defaultValue;
+    saveSettingsDebounced?.();
+    toastr?.success?.("Template reset to its default contents");
+}
+
+function refreshDefaultQigApiTemplateField(settingKey, fieldId) {
+    const settings = getSettings();
+    if (!settings || settings[settingKey] !== null) return;
+    const field = document.getElementById(fieldId);
+    if (field) field.value = getDefaultQigApiTemplate(settings, settingKey);
+}
+
+function getQigStyleText(settings, side) {
+    const key = side === "prefix" ? "stylePrefixOverride" : "styleSuffixOverride";
+    const override = settings?.[key];
+    if (typeof override === "string") return override;
+    return String(STYLES?.[settings?.style]?.[side] || "");
+}
+
+function resetQigStyleTextField(side, fieldId) {
+    const settings = getSettings();
+    const key = side === "prefix" ? "stylePrefixOverride" : "styleSuffixOverride";
+    settings[key] = null;
+    const field = document.getElementById(fieldId);
+    if (field) field.value = getQigStyleText(settings, side);
+    saveSettingsDebounced?.();
+    toastr?.success?.(`Style ${side} reset to the selected style default`);
+}
+
+function extractQigWrapper(text, sentinel) {
+    const source = String(text ?? "");
+    const marker = String(sentinel || "");
+    const index = source.indexOf(marker);
+    if (index < 0) return { prefix: source, suffix: "" };
+    return {
+        prefix: source.slice(0, index),
+        suffix: source.slice(index + marker.length),
+    };
+}
+
+function getQigSTStyleWrappers(context) {
+    const positiveSentinel = `__QIG_POSITIVE_${generateUUID()}__`;
+    const negativeSentinel = `__QIG_NEGATIVE_${generateUUID()}__`;
+    const styled = applySTStylePrompts(positiveSentinel, negativeSentinel, context);
+    return {
+        positive: extractQigWrapper(styled?.prompt, positiveSentinel),
+        negative: extractQigWrapper(styled?.negative, negativeSentinel),
+    };
+}
+
+async function resolveQigProviderPromptTemplates({
+    settings,
+    positiveTemplate,
+    negativeTemplate,
+    basePrompt,
+    baseNegative,
+    context,
+    matchedFilters = [],
+    alreadyFinal = false,
+} = {}) {
+    const positiveSource = String(positiveTemplate ?? getQigApiTemplate(settings, "imageProviderPositiveTemplate"));
+    const negativeSource = String(negativeTemplate ?? getQigApiTemplate(settings, "imageProviderNegativeTemplate"));
+    const wrappers = alreadyFinal || settings?.useSTStyle === false
+        ? { positive: { prefix: "", suffix: "" }, negative: { prefix: "", suffix: "" } }
+        : getQigSTStyleWrappers(context);
+    const macroValues = buildQigSourceDrivenMacroValues(settings, {
+        imagePrompt: String(basePrompt ?? ""),
+        negativePrompt: String(baseNegative ?? ""),
+        stPositivePrefix: wrappers.positive.prefix,
+        stPositiveSuffix: wrappers.positive.suffix,
+        stNegativePrefix: wrappers.negative.prefix,
+        stNegativeSuffix: wrappers.negative.suffix,
+    });
+    let prompt = resolveQigApiTextTemplate(positiveSource, macroValues).replace(/\r?\n$/, "");
+    let negative = resolveQigApiTextTemplate(negativeSource, macroValues).replace(/\r?\n$/, "");
+
+    if (!alreadyFinal
+        && isDefaultQigApiTemplate(settings, "imageProviderPositiveTemplate")
+        && isDefaultQigApiTemplate(settings, "imageProviderNegativeTemplate")
+        && !hasSavedQigMacroSources(settings)) {
+        let legacyPrompt = getQigStyleText(settings, "prefix") + String(basePrompt ?? "") + getQigStyleText(settings, "suffix");
+        if (settings?.appendQuality && settings?.qualityTags) legacyPrompt = `${settings.qualityTags}, ${legacyPrompt}`;
+        let legacyNegative = String(baseNegative ?? "");
+        if (settings?.useSTStyle !== false) {
+            ({ prompt: legacyPrompt, negative: legacyNegative } = applySTStylePrompts(legacyPrompt, legacyNegative, context));
+        }
+        if (prompt !== legacyPrompt || negative !== legacyNegative) {
+            throw new Error("Default provider templates did not reproduce the index3 pre-filter prompts exactly");
+        }
+    }
+
+    if (!alreadyFinal && matchedFilters.length) {
+        const applied = applyMatchedFiltersWithDebug(prompt, negative, matchedFilters, "Template contextual filter");
+        prompt = applied.prompt;
+        negative = applied.negative;
+    }
+
+    prompt = expandWildcards(prompt);
+    negative = expandWildcards(negative);
+    return { prompt, negative };
+}
+
+
+const QIG_MACRO_INSPECTOR_GROUPS = Object.freeze([
+    {
+        label: "External extension settings",
+        macros: [
+            ["qig_st_positive_prefix", "Text inserted before the positive prompt by SillyTavern's Image Generation style settings.", "SillyTavern Image Generation / Stable Diffusion extension settings", "SillyTavern Extensions → Image Generation"],
+            ["qig_st_positive_suffix", "Text inserted after the positive prompt by SillyTavern's Image Generation style settings.", "SillyTavern Image Generation / Stable Diffusion extension settings", "SillyTavern Extensions → Image Generation"],
+            ["qig_st_negative_prefix", "Text inserted before QIG's negative prompt by SillyTavern's Image Generation style settings.", "SillyTavern Image Generation / Stable Diffusion extension settings", "SillyTavern Extensions → Image Generation"],
+            ["qig_st_negative_suffix", "Text inserted after QIG's negative prompt by SillyTavern's Image Generation style settings.", "SillyTavern Image Generation / Stable Diffusion extension settings", "SillyTavern Extensions → Image Generation"],
+        ],
+    },
+    {
+        label: "SillyTavern chat, character card, and persona context",
+        macros: [
+            ["qig_scene", "The latest non-user character message, used as the inspector's scene context.", "Current SillyTavern chat", "Edit the latest character message"],
+            ["qig_character_name", "The current character name used by nested macros.", "Current SillyTavern character or group context", "Edit the character card name or active group members"],
+            ["qig_user_name", "The current SillyTavern user/persona name used by nested macros.", "Current SillyTavern user or persona context", "Edit the active persona or SillyTavern user name"],
+            ["qig_character_description", "The resolved active character description/profile text.", "Current SillyTavern character card or group context", "Edit the character card description"],
+            ["qig_user_persona", "The resolved active user-persona description.", "Current SillyTavern persona", "Edit the active persona"],
+            ["qig_character_tags", "The resolved tags from the current character context.", "Current SillyTavern character card", "Edit the character card tags"],
+            ["qig_scenario", "The resolved scenario from the current character context.", "Current SillyTavern character card", "Edit the character card scenario"],
+            ["qig_active_character_list", "The comma-separated active character names used by exact-name macros.", "Current SillyTavern character or group context", "Edit the character card name or active group members"],
+            ["qig_mentioned_character_list", "The comma-separated active character names explicitly mentioned in the selected scene.", "Current SillyTavern chat and character context", "Edit the selected scene or active character names"],
+            ["qig_skin_tones", "Explicit skin-tone text detected in the current character card or user persona.", "Current SillyTavern character card and persona", "Edit the character card or active persona"],
+            ["qig_appearance_context", "Resolved character appearance, persona, tags, and scenario context assembled for the image-prompt request.", "Current character card, persona, chat, and QIG context rules", "This macro row → Text; nested values are listed separately"],
+            ["qig_reference_block", "Reference context block assembled for the optional scene-description request.", "Current character card, persona, tags, and scenario", "Edit the character card, persona, or relevant SillyTavern context"],
+        ],
+    },
+    {
+        label: "QIG editable settings",
+        macros: [
+            ["qig_negative_prompt", "The configured QIG negative prompt.", "QIG setting", "Quick Image Gen → Negative Prompt"],
+            ["qig_quality_tags", "The configured Quality Tags text without an added separator.", "QIG setting", "Quick Image Gen → Quality Tags"],
+            ["qig_quality_prefix", "Quality Tags followed by the separator used before the positive prompt; empty when quality tags are disabled.", "QIG setting", "Quick Image Gen → Quality Tags and Append quality tags"],
+            ["qig_style_prefix", "The current QIG style prefix or its editable override.", "QIG style setting", "Quick Image Gen → API Text Templates → Style prefix"],
+            ["qig_style_suffix", "The current QIG style suffix or its editable override.", "QIG style setting", "Quick Image Gen → API Text Templates → Style suffix"],
+            ["qig_inject_instruction", "The resolved instruction used by the missing-image-tag fallback request.", "QIG inject-tag setting", "Quick Image Gen → Image-tag injection settings"],
+            ["qig_prefill", "The resolved Text AI response prefill.", "QIG Text AI setting", "Quick Image Gen → Prefill"],
+            ["qig_custom_instruction_resolved", "The custom image-prompt instruction after {{scene}}, {{char}}, {{user}}, {{charDesc}}, and {{userDesc}} substitutions, before automatic additions.", "QIG custom instruction plus current SillyTavern context", "Quick Image Gen → Custom LLM Instruction"],
+            ["qig_custom_scene_append", "The selected-scene block inserted when a custom Text AI instruction omits its {{scene}} placeholder.", "QIG editable macro text plus current scene context", "This macro row → Text"],
+        ],
+    },
+    {
+        label: "QIG runtime values",
+        macros: [
+            ["qig_image_prompt", "The base positive image prompt produced or selected during a generation run, before provider-template wrappers are added.", "Current QIG generation run", "Edit the applicable prompt source or the final review popup"],
+            ["qig_character_name_plural_suffix", "The letter s when multiple active character names are present; otherwise empty.", "QIG runtime grammar value", "Determined by the active character count"],
+            ["qig_natural_artist", "The artist name selected for a natural-language Text AI request when artist additions are enabled.", "QIG runtime artist selection", "Controlled by the artist-addition option and QIG artist list"],
+            ["qig_tags_artist", "The artist tag selected for a tag-format Text AI request when artist additions are enabled.", "QIG runtime artist selection", "Controlled by the artist-addition option and QIG artist list"],
+            ["qig_custom_artist", "The artist tag selected for a custom Text AI request when artist additions are enabled.", "QIG runtime artist selection", "Controlled by the artist-addition option and QIG artist list"],
+        ],
+    },
+    {
+        label: "QIG-generated instruction and context fragments",
+        macros: [
+            ["qig_skin_enforce", "A skin-tone preservation instruction built from explicit skin-tone text in the character card or persona.", "QIG-generated from SillyTavern character/persona context", "Edit the character card or persona"],
+            ["qig_multi_message_context_block", "Instructions explaining how to convert a selected multi-message transcript into one visual moment.", "QIG editable macro text", "This macro row → Text"],
+            ["qig_exact_name_block", "An exact-character-name preservation block built from the active character names.", "QIG-generated from SillyTavern character context", "Edit the character card/name or QIG context rules"],
+            ["qig_user_name_block", "A user-persona-name instruction shown when a user persona is available.", "QIG-generated from SillyTavern persona context", "Edit the active persona"],
+            ["qig_identity_requirement_block", "General identity-preservation requirements, with an extra user-persona rule when applicable.", "QIG editable macro text", "This macro row → Text"],
+            ["qig_subject_priority_block", "Scene-specific subject-priority rules inferred from the latest character message and available profiles.", "QIG-generated from current scene and profiles", "Edit the latest character message, character card, or persona"],
+            ["qig_natural_scene_line", "The scene line inserted into the natural-language image-prompt request.", "QIG-generated from the latest character message", "Edit the latest character message"],
+            ["qig_natural_exact_name_bullet", "The natural-prompt bullet requiring exact active character names when applicable.", "QIG-generated from character context", "Edit the character card/name or QIG context rules"],
+            ["qig_user_scene_requirement_bullet", "The prompt bullet that maps first-person references to the active user persona.", "QIG-generated from persona context", "Edit the active persona"],
+            ["qig_natural_enhancement_section", "Optional natural-prompt quality, lighting, and artist requirements enabled in QIG.", "QIG-generated from editable QIG options", "Quick Image Gen → Text AI enhancement options"],
+            ["qig_natural_restrictions", "Natural-prompt restrictions, including the no-artist rule when artist tags are disabled.", "QIG-generated from editable QIG options", "Quick Image Gen → Text AI enhancement options"],
+            ["qig_tags_scene_line", "The latest character message formatted as the scene line for the tag-style request.", "QIG-generated from the latest character message", "Edit the latest character message"],
+            ["qig_tags_exact_name_clause", "The exact-name clause appended to the tag-format character-name requirement.", "QIG-generated from character context", "Edit the character card/name or QIG context rules"],
+            ["qig_tags_enhancement_section", "Optional tag-format quality, lighting, and artist requirements enabled in QIG.", "QIG-generated from editable QIG options", "Quick Image Gen → Text AI enhancement options"],
+            ["qig_tags_restrictions", "The mandatory tag-format restrictions and the current artist-name rule.", "QIG-generated from editable QIG options", "Quick Image Gen → Text AI enhancement options"],
+            ["qig_scene_description_context_suffix", "The word CONTEXT added to the scene-description heading for multi-message scenes.", "QIG editable macro text", "This macro row → Text"],
+            ["qig_scene_description_multi_message_rule", "The extra scene-description rule used for a multi-message transcript.", "QIG editable macro text", "This macro row → Text"],
+            ["qig_custom_enhancement_section", "Automatic quality, lighting, or artist additions appended to a custom image-prompt instruction.", "QIG-generated from editable QIG options", "Quick Image Gen → Text AI enhancement options"],
+            ["qig_custom_name_requirements", "Name-preservation requirements appended to a custom image-prompt instruction.", "QIG-generated from current names and persona", "Edit the character card/name, persona, or QIG context rules"],
+            ["qig_custom_instruction_with_entropy", "The complete current image-prompt instruction after QIG additions and request-uniqueness markers, but before the timestamp prefix and prefill hint.", "QIG-generated request preview", "Edit its component settings and templates"],
+            ["qig_prefill_hint", "The explanatory prefill block appended to the Text AI request when a prefill is configured.", "QIG-generated from the QIG Prefill setting", "Quick Image Gen → Prefill"],
+        ],
+    },
+    {
+        label: "Request metadata and cache-busting values",
+        macros: [
+            ["qig_timestamp", "The numeric timestamp used for the current request preview.", "QIG runtime metadata", "Generated automatically"],
+            ["qig_random", "The random request token used for cache-busting.", "QIG runtime metadata", "Generated automatically"],
+            ["qig_request_id", "The combined timestamp and random request identifier.", "QIG runtime metadata", "Generated automatically"],
+            ["qig_request_marker", "The inline request marker built from the request identifier.", "QIG runtime metadata", "Generated automatically"],
+            ["qig_timestamp_prefix", "The timestamp line inserted at the beginning of a Text AI request.", "QIG runtime metadata", "Generated automatically"],
+            ["qig_output_ref_suffix", "The short output-reference marker appended after Tags: or Prompt:.", "QIG runtime metadata", "Generated automatically"],
+            ["qig_request_marker_suffix", "The full request-marker block appended to a scene-description request.", "QIG runtime metadata", "Generated automatically"],
+        ],
+    },
+]);
+
+const QIG_MACRO_INSERTION_RULES = Object.freeze({
+    qig_st_positive_prefix: "Inserted before the positive provider prompt when SillyTavern Image Generation style integration adds a positive prefix.",
+    qig_st_positive_suffix: "Inserted after the positive provider prompt when SillyTavern Image Generation style integration adds a positive suffix.",
+    qig_st_negative_prefix: "Inserted before the negative provider prompt when SillyTavern Image Generation style integration adds a negative prefix.",
+    qig_st_negative_suffix: "Inserted after the negative provider prompt when SillyTavern Image Generation style integration adds a negative suffix.",
+    qig_scene: "Uses the latest non-user character message for the inspector preview. During generation, it uses the scene selected by that generation path.",
+    qig_character_name: "Available when a character name is present in the current character or group context.",
+    qig_user_name: "Available from the current SillyTavern user or active persona name.",
+    qig_character_description: "Available when the active character context has description/profile text.",
+    qig_user_persona: "Available when an active user persona has description text.",
+    qig_character_tags: "Available when the active character context has tags.",
+    qig_scenario: "Available when the active character context has scenario text.",
+    qig_active_character_list: "Available when one or more active character names are known.",
+    qig_mentioned_character_list: "Available when active character names are explicitly mentioned in the selected scene.",
+    qig_skin_tones: "Available when explicit skin-tone text is detected in the current character card or user persona.",
+    qig_appearance_context: "Inserted when character-card, persona, tag, or scenario context is available.",
+    qig_reference_block: "Inserted into scene-description requests when character, persona, tag, scenario, or active-name reference context is available.",
+    qig_negative_prompt: "Inserted wherever the current request template includes this macro.",
+    qig_quality_tags: "Inserted wherever the current request template includes this macro.",
+    qig_quality_prefix: "Inserted before the positive prompt when Append quality tags is enabled and Quality Tags is not empty. Not inserted when a prompt is already final.",
+    qig_style_prefix: "Inserted before the base image prompt when a QIG style prefix is active. Not inserted when a prompt is already final.",
+    qig_style_suffix: "Inserted after the base image prompt when a QIG style suffix is active. Not inserted when a prompt is already final.",
+    qig_inject_instruction: "Inserted into the missing-image-tag Text AI request.",
+    qig_prefill: "Inserted wherever a request template includes this macro and a Text AI prefill is configured.",
+    qig_custom_instruction_resolved: "Available when a custom image-prompt instruction is configured; its ordinary SillyTavern/QIG placeholders are resolved first.",
+    qig_custom_scene_append: "Inserted only when a custom Text AI instruction does not already contain its own {{scene}} placeholder. The heading changes for single-message and multi-message scenes.",
+    qig_image_prompt: "Available after the current generation path has produced or selected its base positive image prompt.",
+    qig_character_name_plural_suffix: "Contains s when more than one active character name is present; otherwise empty.",
+    qig_natural_artist: "Available during a natural-language request when artist additions are enabled.",
+    qig_tags_artist: "Available during a tag-format request when artist additions are enabled.",
+    qig_custom_artist: "Available during a custom request when artist additions are enabled.",
+    qig_skin_enforce: "Inserted when explicit skin-tone text is found in the active character-card or user-persona context.",
+    qig_multi_message_context_block: "Inserted for multi-message scenes. Not inserted for single-message scenes.",
+    qig_exact_name_block: "Inserted when exact-name requirements are enabled and active character names are available.",
+    qig_user_name_block: "Inserted when an active user persona is available.",
+    qig_identity_requirement_block: "Inserted in the built-in image-prompt instructions. Its user-persona line is included only when an active persona is available.",
+    qig_subject_priority_block: "Inserted when the selected scene and available profiles produce a subject-priority rule. Otherwise it is not inserted.",
+    qig_natural_scene_line: "Inserted in natural-language image-prompt requests. It uses a different heading for single-message and multi-message scenes.",
+    qig_natural_exact_name_bullet: "Inserted in natural-language requests when exact-name requirements are active.",
+    qig_user_scene_requirement_bullet: "Inserted in natural-language requests when an active user persona is available.",
+    qig_natural_enhancement_section: "Inserted in natural-language requests when at least one quality, lighting, or artist enhancement option is enabled.",
+    qig_natural_restrictions: "Inserted in natural-language requests when artist additions are disabled. Not inserted when artist additions are enabled.",
+    qig_tags_scene_line: "Inserted in tag-style image-prompt requests. It uses a different heading for single-message and multi-message scenes.",
+    qig_tags_exact_name_clause: "Inserted in tag-style requests when exact-name requirements are active.",
+    qig_tags_enhancement_section: "Inserted in tag-style requests when at least one quality, lighting, or artist enhancement option is enabled.",
+    qig_tags_restrictions: "Inserted in tag-style requests. Its final no-artist line is included only when artist additions are disabled.",
+    qig_scene_description_context_suffix: "Inserted after SELECTED SCENE for multi-message scene-description requests. Not inserted for single-message scenes.",
+    qig_scene_description_multi_message_rule: "Inserted for multi-message scene-description requests. Not inserted for single-message scenes.",
+    qig_custom_enhancement_section: "Inserted into custom image-prompt requests when at least one quality, lighting, or artist enhancement option is enabled.",
+    qig_custom_name_requirements: "Inserted into custom image-prompt requests when exact-name requirements are active or an active user persona is available.",
+    qig_custom_instruction_with_entropy: "Available when a custom image-prompt instruction is configured. It combines the custom instruction with the enabled QIG additions and request markers.",
+    qig_prefill_hint: "Inserted at the end of a Text AI request when a prefill is configured. Not inserted when Prefill is empty.",
+    qig_timestamp: "Generated while a request is assembled.",
+    qig_random: "Generated while a request is assembled.",
+    qig_request_id: "Generated while a request is assembled from the timestamp and random token.",
+    qig_request_marker: "Generated while a request is assembled when a request identifier exists.",
+    qig_timestamp_prefix: "Inserted at the beginning of Text AI requests when a request timestamp exists.",
+    qig_output_ref_suffix: "Inserted after Tags: or Prompt: when the request has a random reference token.",
+    qig_request_marker_suffix: "Inserted at the end of scene-description requests when a request marker exists.",
+});
+
+function getQigLatestCharacterMessageContext(ctx = getContext?.()) {
+    const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+    for (let index = chat.length - 1; index >= 0; index--) {
+        const message = chat[index];
+        if (!message || typeof message !== "object" || message.is_user || message.is_system) continue;
+        const sources = getSceneMessageSources(message);
+        const text = sources[0]?.text || normalizeSceneMessageText(message.mes || "");
+        if (!text) continue;
+        return {
+            index,
+            message,
+            text,
+            speaker: String(message.name || ctx?.name2 || "character").trim() || "character",
+        };
+    }
+    return { index: null, message: null, text: "", speaker: "character" };
+}
+
+function buildQigMacroInspectorValues(settings = getSettings(), ctx = getContext?.()) {
+    const s = settings || getSettings() || {};
+    const latest = getQigLatestCharacterMessageContext(ctx);
+    const basePrompt = latest.text;
+    const profile = resolveLLMPromptProfileContext(ctx, basePrompt);
+    const charName = profile.charNameJoined || "character";
+    const userName = profile.userName || "user";
+    const charDesc = profile.charDescResolved || "";
+    const userPersona = profile.userDescResolved || "";
+    const scenario = profile.charScenarioResolved || "";
+    const tags = profile.charTagsResolved || "";
+    const activeCharacterNames = uniqueStringList(profile.charNames || []);
+    const resolvedPrefill = getResolvedLLMPrefill(s);
+    const isMultiMessage = false;
+    const sceneUsesFirstPersonUser = /\b(i|me|my|mine|myself)\b/i.test(basePrompt);
+    const sceneMentionsUserByName = promptIncludesName(basePrompt, userName);
+    const sceneMentionedCharacterNames = activeCharacterNames.filter(name => promptIncludesName(basePrompt, name));
+    const sceneCentersUserAppearance = /\b(reflection|mirror|mirrored|view(?:ing)?\s+my\s+reflection|look(?:ing)?\s+at\s+myself|my\s+(?:face|body|figure|appearance|skin|eyes|reflection))\b/i.test(basePrompt);
+    const sceneIncludesUserPersona = !!userPersona && (sceneUsesFirstPersonUser || sceneMentionsUserByName);
+    const shouldDeprioritizeUnmentionedCharacters = sceneIncludesUserPersona && !sceneMentionedCharacterNames.length;
+    const userLikelyPrimarySubject = sceneIncludesUserPersona && sceneCentersUserAppearance;
+    const skinTones = [];
+    const charSkin = charDesc.match(skinPattern);
+    const userSkin = userPersona.match(skinPattern);
+    if (charSkin) skinTones.push(`${charName}: ${charSkin[0]}`);
+    if (userSkin) skinTones.push(`${userName}: ${userSkin[0]}`);
+    const shouldUseExactNameRequirements = !!profile.useExactNameRequirements && activeCharacterNames.length > 0;
+
+    const customInstructionSource = String(s.llmCustomInstruction || "");
+    const customInstructionResolved = customInstructionSource.trim()
+        ? customInstructionSource
+            .replace(/\{\{scene\}\}/gi, basePrompt)
+            .replace(/\{\{charDesc\}\}/gi, charDesc.substring(0, 1500))
+            .replace(/\{\{userDesc\}\}/gi, userPersona.substring(0, 800))
+            .replace(/\{\{char\}\}/gi, charName)
+            .replace(/\{\{user\}\}/gi, userName)
+        : "";
+    let wrappers = { positive: { prefix: "", suffix: "" }, negative: { prefix: "", suffix: "" } };
+    try {
+        if (s.useSTStyle !== false) wrappers = getQigSTStyleWrappers(ctx);
+    } catch (error) {
+        log(`Macro Inspector: could not resolve SillyTavern style wrappers: ${error?.message || error}`);
+    }
+
+    const values = buildQigSourceDrivenMacroValues(s, {
+        scene: basePrompt,
+        charName,
+        userName,
+        charDesc: charDesc.substring(0, 1500),
+        userPersona: userPersona.substring(0, 800),
+        tags,
+        scenario: scenario.substring(0, 400),
+        activeCharacterNames,
+        usesCurrentCardContext: profile.usesCurrentCardContext,
+        sceneIncludesUserPersona,
+        shouldDeprioritizeUnmentionedCharacters,
+        userLikelyPrimarySubject,
+        sceneMentionedCharacterNames,
+        isMultiMessage,
+        shouldUseExactNameRequirements,
+        skinTones,
+        resolvedPrefill,
+        customInstructionResolved,
+        customSceneNeedsAppend: !!customInstructionResolved && !customInstructionHasMacro(customInstructionSource, "scene"),
+        naturalArtist: s.llmAddArtist ? getRandomArtist(false) : "",
+        tagsArtist: s.llmAddArtist ? getRandomArtist(true) : "",
+        customArtist: s.llmAddArtist ? getRandomArtist(true) : "",
+        negativePrompt: String(s.negativePrompt || ""),
+        injectInstruction: resolvePrompt(getInjectPromptTemplate(s)),
+        stPositivePrefix: wrappers.positive.prefix,
+        stPositiveSuffix: wrappers.positive.suffix,
+        stNegativePrefix: wrappers.negative.prefix,
+        stNegativeSuffix: wrappers.negative.suffix,
+    });
+
+    return { values, latest };
+}
+
+function getQigMacroInspectorStatus(macroName, value, latest, hasLastValue) {
+    if (macroName === "qig_scene" && !latest?.text) {
+        return hasLastValue
+            ? "No current character message is available; Content shows the value captured during the last generation."
+            : "No current character message is available, and no generation value has been saved yet.";
+    }
+    if (!String(value ?? "")) {
+        return hasLastValue
+            ? "No current value is available; Content shows the value captured during the last generation."
+            : "No current value is available.";
+    }
+    return "Resolved from the current context and settings.";
+}
+
+function renderQigMacroInspector(settings = getSettings()) {
+    const preview = buildQigMacroInspectorValues(settings, getContext?.());
+    const values = normalizeQigTemplateValues(preview.values);
+    const lastGenerationValues = getQigLastGenerationMacroValues(settings);
+    const macros = QIG_MACRO_INSPECTOR_GROUPS
+        .flatMap(group => group.macros)
+        .slice()
+        .sort(([nameA], [nameB]) => nameA.localeCompare(nameB));
+
+    const rows = macros.map(([name, description, source, editableAt]) => {
+            const value = String(values[name] ?? "");
+            const hasLastValue = Object.prototype.hasOwnProperty.call(lastGenerationValues, name);
+            const lastValue = hasLastValue ? String(lastGenerationValues[name] ?? "") : "";
+            const sourceDefinition = QIG_MACRO_SOURCE_DEFINITIONS[name];
+            const hasSourceField = !!sourceDefinition;
+            const insertedWhen = QIG_MACRO_INSERTION_RULES[name] || "Inserted wherever the active request template includes this macro.";
+
+            if (hasSourceField) {
+                const sourceText = getQigMacroSourceText(settings, name);
+                const sourceRows = Math.min(18, Math.max(4, sourceText.split(/\r?\n/).length));
+
+                return `<details class="qig-macro-inspector__macro" data-qig-macro="${escapeHtml(name)}" style="border:1px solid var(--SmartThemeBorderColor);border-radius:6px;margin:6px 0;padding:0 8px;">
+                    <summary style="cursor:pointer;padding:8px 0;"><code>{{${escapeHtml(name)}}}</code></summary>
+                    <div style="padding:0 0 10px 0;">
+                        <dl style="display:grid;grid-template-columns:max-content minmax(0, 1fr);gap:6px 10px;margin:8px 0 0 0;align-items:start;">
+                            <dt><strong>Text</strong></dt><dd style="margin:0;">
+                                <textarea data-qig-macro-source-editor="${escapeHtml(name)}" rows="${sourceRows}" style="width:100%;resize:vertical;">${escapeHtml(sourceText)}</textarea>
+                                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;">
+                                    <button type="button" class="menu_button" data-qig-macro-source-reset="${escapeHtml(name)}">Reset</button>
+                                </div>
+                            </dd>
+                            <dt><strong>Description</strong></dt><dd style="margin:0;">${escapeHtml(description)}</dd>
+                            <dt><strong>Inserted when</strong></dt><dd style="margin:0;">${escapeHtml(insertedWhen)}</dd>
+                        </dl>
+                    </div>
+                </details>`;
+            }
+
+            const displayValue = value
+                || (hasLastValue
+                    ? `Currently empty. Value during last generation: ${lastValue || "(empty)"}`
+                    : "Currently empty.");
+            const rowCount = Math.min(14, Math.max(3, displayValue.split(/\r?\n/).length));
+            const status = getQigMacroInspectorStatus(name, value, preview.latest, hasLastValue);
+
+            return `<details class="qig-macro-inspector__macro" data-qig-macro="${escapeHtml(name)}" style="border:1px solid var(--SmartThemeBorderColor);border-radius:6px;margin:6px 0;padding:0 8px;">
+                <summary style="cursor:pointer;padding:8px 0;"><code>{{${escapeHtml(name)}}}</code></summary>
+                <div style="padding:0 0 10px 0;">
+                    <dl style="display:grid;grid-template-columns:max-content minmax(0, 1fr);gap:6px 10px;margin:8px 0 0 0;align-items:start;">
+                        <dt><strong>Content</strong></dt><dd style="margin:0;"><textarea readonly rows="${rowCount}" style="width:100%;resize:vertical;">${escapeHtml(displayValue)}</textarea></dd>
+                        <dt><strong>Description</strong></dt><dd style="margin:0;">${escapeHtml(description)}</dd>
+                        <dt><strong>Used when</strong></dt><dd style="margin:0;">${escapeHtml(insertedWhen)}</dd>
+                        <dt><strong>Source</strong></dt><dd style="margin:0;">${escapeHtml(source)}</dd>
+                        <dt><strong>Editable at</strong></dt><dd style="margin:0;">${escapeHtml(editableAt)}</dd>
+                        <dt><strong>Status</strong></dt><dd style="margin:0;">${escapeHtml(status)}</dd>
+                    </dl>
+                </div>
+            </details>`;
+    }).join("");
+
+    return rows;
+}
+
+function refreshQigMacroInspector() {
+    const container = document.getElementById("qig-macro-inspector-list");
+    if (!container) return;
+    container.innerHTML = renderQigMacroInspector(getSettings());
+    bindQigMacroInspector();
+}
+
+function bindQigMacroInspector() {
+    const refreshButton = document.getElementById("qig-refresh-macro-inspector");
+    if (refreshButton) refreshButton.onclick = refreshQigMacroInspector;
+
+    const container = document.getElementById("qig-macro-inspector-list");
+    if (!container) return;
+    container.oninput = (event) => {
+        const editor = event.target?.closest?.("[data-qig-macro-source-editor]");
+        if (!editor) return;
+        const macroName = String(editor.getAttribute("data-qig-macro-source-editor") || "").toLowerCase();
+        if (!QIG_SOURCE_TEXT_MACROS.has(macroName)) return;
+        const settings = getSettings();
+        const sources = { ...getQigMacroTextSources(settings) };
+        sources[macroName] = String(editor.value ?? "");
+        settings.macroTextSources = sources;
+        saveSettingsDebounced?.();
+    };
+    container.onclick = (event) => {
+        const resetButton = event.target?.closest?.("[data-qig-macro-source-reset]");
+        if (!resetButton) return;
+        const macroName = String(resetButton.getAttribute("data-qig-macro-source-reset") || "").toLowerCase();
+        if (!QIG_SOURCE_TEXT_MACROS.has(macroName)) return;
+        const settings = getSettings();
+        const sources = { ...getQigMacroTextSources(settings) };
+        delete sources[macroName];
+        settings.macroTextSources = sources;
+        const editor = resetButton.closest("[data-qig-macro]")?.querySelector?.(`[data-qig-macro-source-editor="${macroName}"]`);
+        if (editor) editor.value = getQigMacroSourceText(settings, macroName);
+        saveSettingsDebounced?.();
+    };
+}
+
 function getSettings() {
     return extension_settings[extensionName];
 }
@@ -5366,7 +6639,7 @@ function applyStyle(prompt, s) {
     const style = STYLES[s.style];
     if (!style) return prompt;
 
-    const result = style.prefix + prompt + style.suffix;
+    const result = getQigStyleText(s, "prefix") + prompt + getQigStyleText(s, "suffix");
 
     styleCache.set(cacheKey, result);
     if (styleCache.size > 100) styleCache.delete(styleCache.keys().next().value);
@@ -6069,20 +7342,7 @@ async function generateSceneDescription(s, sceneText, signal, options = {}) {
         if (activeCharacterList) referenceSections.push(`Active character names to preserve when visible: ${activeCharacterList}`);
         const referenceBlock = referenceSections.length ? `\nREFERENCE CONTEXT:\n${referenceSections.join("\n")}` : "";
 
-        const customInstruction = String(s.twoStepInstruction || "").trim();
-        let instruction;
-        if (customInstruction) {
-            instruction = customInstruction
-                .replace(/\{\{scene\}\}/gi, selectedScene)
-                .replace(/\{\{charDesc\}\}/gi, charDesc.substring(0, 1500))
-                .replace(/\{\{userDesc\}\}/gi, userPersona.substring(0, 800))
-                .replace(/\{\{char\}\}/gi, charName)
-                .replace(/\{\{user\}\}/gi, userName);
-            if (!customInstructionHasMacro(customInstruction, "scene")) {
-                instruction += `\n\nSELECTED SCENE${isMultiMessage ? " CONTEXT" : ""}:\n${selectedScene}`;
-            }
-        } else {
-            instruction = `[STANDALONE VISUAL SCENE DESCRIPTION TASK]
+        const instruction = `[STANDALONE VISUAL SCENE DESCRIPTION TASK]
 
 Convert the selected chat scene into one concise plain-language visual description for an image generator.
 
@@ -6097,12 +7357,41 @@ SELECTED SCENE${isMultiMessage ? " CONTEXT" : ""}:
 ${selectedScene}
 
 Plain visual description:`;
-        }
 
         const timestamp = Date.now();
         const randomPart = Math.random().toString(36).substring(2, 11);
         const entropyInline = `{{${timestamp}_${randomPart}}}`;
-        const instructionWithEntropy = `[${timestamp}]\n${instruction}\n\nRequest marker: ${entropyInline}`;
+        const generatedRequest = `[${timestamp}]\n${instruction}\n\nRequest marker: ${entropyInline}`;
+        const sceneDescriptionTemplate = getQigApiTemplate(s, "textAiSceneDescriptionTemplate");
+        let instructionWithEntropy = resolveQigApiTextTemplate(
+            sceneDescriptionTemplate,
+            buildQigSourceDrivenMacroValues(s, {
+                scene: selectedScene,
+                charName,
+                userName,
+                charDesc: charDesc.substring(0, 1500),
+                userPersona: userPersona.substring(0, 800),
+                tags,
+                scenario: scenario.substring(0, 400),
+                activeCharacterNames,
+                usesCurrentCardContext: profile.usesCurrentCardContext,
+                isMultiMessage,
+                timestamp,
+                randomPart,
+                negativePrompt: String(s.negativePrompt || ""),
+                injectInstruction: resolvePrompt(getInjectPromptTemplate(s)),
+            })
+        );
+        if (isDefaultQigApiTemplate(s, "textAiSceneDescriptionTemplate")
+            && !hasSavedQigMacroSources(s)
+            && instructionWithEntropy !== generatedRequest) {
+            throw new Error("Default scene-description template did not reproduce the index3 request exactly");
+        }
+        instructionWithEntropy = await showLLMRequestEditDialog(instructionWithEntropy, signal, {
+            title: "Review Scene Description Request",
+            description: "This is the complete request that will be sent to the Text AI to create the intermediate scene description.",
+        });
+        if (signal?.aborted) throw getAbortError(signal);
 
         log(`Sending scene description instruction to LLM (length: ${instructionWithEntropy.length} chars)`);
 
@@ -6266,6 +7555,18 @@ async function generateLLMPrompt(s, basePrompt, signal, options = {}) {
         log(`LLM scene mode: ${isMultiMessage ? "multi-message transcript" : "single-message scene"} (${basePrompt.length} chars)`);
 
         let instruction;
+        let customInstructionResolved = "";
+        let customEnhancements = "";
+        let customEnhancementSection = "";
+        let customNameRequirements = "";
+        let customSceneAppend = "";
+        let naturalEnhancements = "";
+        let naturalRestrictions = "";
+        let tagsEnhancements = "";
+        let tagsRestrictions = "";
+        let naturalArtist = "";
+        let tagsArtist = "";
+        let customArtist = "";
         if (isCustom) {
             log(`Custom macros: scene=${basePrompt.length}ch, char="${charName}", user="${userName}", charDesc=${charDesc.length}ch, userDesc=${userPersona.length}ch`);
             log(`Using custom instruction: ${s.llmCustomInstruction.substring(0, 100)}...`);
@@ -6275,28 +7576,31 @@ async function generateLLMPrompt(s, basePrompt, signal, options = {}) {
                 .replace(/\{\{userDesc\}\}/gi, userPersona.substring(0, 800))
                 .replace(/\{\{char\}\}/gi, charName)
                 .replace(/\{\{user\}\}/gi, userName);
+            customInstructionResolved = instruction;
 
             // Add enhancement options to custom instruction
-            let customEnhancements = "";
             if (s.llmAddQuality) customEnhancements += "\n- Include quality tags (masterpiece, best quality, highly detailed, sharp focus, etc.)";
             if (s.llmAddLighting) customEnhancements += "\n- Include lighting descriptions (dramatic lighting, soft lighting, rim lighting, etc.)";
             if (s.llmAddArtist) {
-                const randomArtist = getRandomArtist(true);
-                customEnhancements += `\n- Include artist tags (e.g., ${randomArtist}, etc.)`;
+                customArtist = getRandomArtist(true);
+                customEnhancements += `\n- Include artist tags (e.g., ${customArtist}, etc.)`;
             }
             if (customEnhancements) {
-                instruction += `\n\nADDITIONAL REQUIREMENTS:${customEnhancements}`;
+                customEnhancementSection = `\n\nADDITIONAL REQUIREMENTS:${customEnhancements}`;
+                instruction += customEnhancementSection;
             }
             if (skinEnforce) {
                 instruction += skinEnforce;
             }
             instruction += `${identityRequirementBlock}${subjectPriorityBlock}`;
             if (exactNameRequirement || exactUserRequirement) {
-                instruction += `\n\nNAME REQUIREMENTS:${exactNameRequirement}${exactUserRequirement}`;
+                customNameRequirements = `\n\nNAME REQUIREMENTS:${exactNameRequirement}${exactUserRequirement}`;
+                instruction += customNameRequirements;
             }
             if (!customInstructionHasMacro(s.llmCustomInstruction, "scene")) {
                 log("Custom instruction missing {{scene}} placeholder; appending selected scene automatically");
-                instruction += `\n\n${isMultiMessage ? "SELECTED SCENE CONTEXT" : "SELECTED SCENE"}:\n${basePrompt}`;
+                customSceneAppend = `\n\n${isMultiMessage ? "SELECTED SCENE CONTEXT" : "SELECTED SCENE"}:\n${basePrompt}`;
+                instruction += customSceneAppend;
             }
         } else if (wantsCustom) {
             log("Custom instruction selected but empty, falling back to tags style");
@@ -6304,15 +7608,13 @@ async function generateLLMPrompt(s, basePrompt, signal, options = {}) {
         }
 
         if (!instruction && isNatural) {
-            let enhancements = "";
-            let restrictions = "";
-            if (s.llmAddQuality) enhancements += "\n- Enhanced quality descriptors (masterpiece, highly detailed, sharp focus, etc.)";
-            if (s.llmAddLighting) enhancements += "\n- Professional lighting descriptions (dramatic lighting, soft lighting, rim lighting, etc.)";
+            if (s.llmAddQuality) naturalEnhancements += "\n- Enhanced quality descriptors (masterpiece, highly detailed, sharp focus, etc.)";
+            if (s.llmAddLighting) naturalEnhancements += "\n- Professional lighting descriptions (dramatic lighting, soft lighting, rim lighting, etc.)";
             if (s.llmAddArtist) {
-                const randomArtist = getRandomArtist(false);
-                enhancements += `\n- Art style references from well-known artists (e.g., ${randomArtist}, etc.)`;
+                naturalArtist = getRandomArtist(false);
+                naturalEnhancements += `\n- Art style references from well-known artists (e.g., ${naturalArtist}, etc.)`;
             }
-            else restrictions += "\n- DO NOT include artist names or art style references";
+            else naturalRestrictions += "\n- DO NOT include artist names or art style references";
 
             instruction = `[STANDALONE IMAGE PROMPT GENERATION TASK]${skinEnforce}
 
@@ -6338,31 +7640,29 @@ ${userSceneRequirementBullet}
 - Their poses, expressions, and body language
 - The setting/background
 - Lighting and atmosphere
-- High quality visual details (sharp focus, detailed rendering, etc.)${enhancements ? `
+- High quality visual details (sharp focus, detailed rendering, etc.)${naturalEnhancements ? `
 
-YOU MUST ALSO INCLUDE:${enhancements}` : ""}${restrictions}
+YOU MUST ALSO INCLUDE:${naturalEnhancements}` : ""}${naturalRestrictions}
 
 Prompt:`;
         }
 
         if (!instruction) {
             // Only generate default instruction if no custom instruction was set
-            let enhancements = "";
-            let restrictions = "";
 
             // Critical restrictions - ALWAYS apply these regardless of settings
-            restrictions += "\nCRITICAL RESTRICTIONS (MUST FOLLOW):";
-            restrictions += "\n- NEVER use realistic style tags (e.g., realistic, photorealistic, hyperrealistic, photography, etc.)";
-            restrictions += "\n- NEVER use realistic artists (e.g., wlop, artgerm, rossdraws, etc.)";
-            restrictions += "\n- NEVER use common/overused artists (e.g., sakimichan, greg rutkowski, alphonse mucha, etc.)";
+            tagsRestrictions += "\nCRITICAL RESTRICTIONS (MUST FOLLOW):";
+            tagsRestrictions += "\n- NEVER use realistic style tags (e.g., realistic, photorealistic, hyperrealistic, photography, etc.)";
+            tagsRestrictions += "\n- NEVER use realistic artists (e.g., wlop, artgerm, rossdraws, etc.)";
+            tagsRestrictions += "\n- NEVER use common/overused artists (e.g., sakimichan, greg rutkowski, alphonse mucha, etc.)";
 
-            if (s.llmAddQuality) enhancements += "\n- Enhanced quality tags (masterpiece, best quality, highly detailed, sharp focus, etc.)";
-            if (s.llmAddLighting) enhancements += "\n- Professional lighting descriptions (dramatic lighting, soft lighting, rim lighting, etc.)";
+            if (s.llmAddQuality) tagsEnhancements += "\n- Enhanced quality tags (masterpiece, best quality, highly detailed, sharp focus, etc.)";
+            if (s.llmAddLighting) tagsEnhancements += "\n- Professional lighting descriptions (dramatic lighting, soft lighting, rim lighting, etc.)";
             if (s.llmAddArtist) {
-                const randomArtist = getRandomArtist(true); // Use tag format for Danbooru style
-                enhancements += `\n- Include artist tags from anime/manga artists (e.g., ${randomArtist}, etc.)`;
+                tagsArtist = getRandomArtist(true); // Use tag format for Danbooru style
+                tagsEnhancements += `\n- Include artist tags from anime/manga artists (e.g., ${tagsArtist}, etc.)`;
             } else {
-                restrictions += "\n- DO NOT include any artist names";
+                tagsRestrictions += "\n- DO NOT include any artist names";
             }
 
             instruction = `### STANDALONE IMAGE GENERATION TASK ###${skinEnforce}
@@ -6398,10 +7698,10 @@ ${userSceneRequirementBullet}
 - Clothing and accessories
 - Pose and expression
 - Background/setting
-- Quality tags (masterpiece, best quality, etc.)${enhancements ? `
+- Quality tags (masterpiece, best quality, etc.)${tagsEnhancements ? `
 
-MUST INCLUDE these additional elements:${enhancements}` : ""}
-${restrictions}
+MUST INCLUDE these additional elements:${tagsEnhancements}` : ""}
+${tagsRestrictions}
 
 Tags:`;
         }
@@ -6429,6 +7729,51 @@ Tags:`;
         // Build the full instruction with optional prefill
         const prefillHint = resolvedPrefill ? `\n\nContinue the output from this exact prefix if your backend supports prefills:\n${resolvedPrefill}` : "";
         instructionWithEntropy += prefillHint;
+
+        const generatedRequest = instructionWithEntropy;
+        const imagePromptTemplate = getQigApiTemplate(s, "textAiImagePromptTemplate");
+        instructionWithEntropy = resolveQigApiTextTemplate(
+            imagePromptTemplate,
+            buildQigSourceDrivenMacroValues(s, {
+                scene: basePrompt,
+                charName,
+                userName,
+                charDesc: charDesc.substring(0, 1500),
+                userPersona: userPersona.substring(0, 800),
+                tags,
+                scenario: scenario.substring(0, 400),
+                activeCharacterNames,
+                usesCurrentCardContext: profile.usesCurrentCardContext,
+                sceneIncludesUserPersona,
+                shouldDeprioritizeUnmentionedCharacters,
+                userLikelyPrimarySubject,
+                sceneMentionedCharacterNames,
+                isMultiMessage,
+                shouldUseExactNameRequirements,
+                skinTones,
+                resolvedPrefill,
+                customInstructionResolved,
+                customSceneNeedsAppend: isCustom && !customInstructionHasMacro(s.llmCustomInstruction, "scene"),
+                naturalArtist: typeof naturalArtist === "string" ? naturalArtist : "",
+                tagsArtist: typeof tagsArtist === "string" ? tagsArtist : "",
+                customArtist: typeof customArtist === "string" ? customArtist : "",
+                timestamp,
+                randomPart,
+                negativePrompt: String(s.negativePrompt || ""),
+                injectInstruction: resolvePrompt(getInjectPromptTemplate(s)),
+            })
+        );
+        if (isDefaultQigApiTemplate(s, "textAiImagePromptTemplate")
+            && !hasSavedQigMacroSources(s)
+            && instructionWithEntropy !== generatedRequest) {
+            throw new Error("Default image-prompt template did not reproduce the index3 request exactly");
+        }
+        instructionWithEntropy = await showLLMRequestEditDialog(instructionWithEntropy, signal, {
+            title: "Review Image Prompt Request",
+            description: "This is the complete request that will be sent to the Text AI to create the image-generation prompt.",
+        });
+        if (signal?.aborted) throw getAbortError(signal);
+        log(`Using reviewed LLM request (length: ${instructionWithEntropy.length} chars)`);
 
         log(isCustom ? "Custom instruction mode" : "Built-in instruction mode");
 
@@ -11068,7 +12413,7 @@ function bindAbortDismiss(signal, dismiss) {
 }
 
 function showPromptEditDialog(prompt, signal) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         const popup = createPopup("qig-prompt-edit-popup", "Edit LLM Generated Prompt", `
             <div class="qig-popup-form qig-prompt-edit-dialog">
                 <textarea id="qig-prompt-edit-text" rows="10" placeholder="Edit the generated prompt..."></textarea>
@@ -11087,20 +12432,26 @@ function showPromptEditDialog(prompt, signal) {
 
             let settled = false;
             let removeAbortListener = () => {};
-            const finish = (value) => {
+            const finishResolve = (value) => {
                 if (settled) return;
                 settled = true;
                 removeAbortListener();
                 hidePopup(popup);
                 resolve(value);
             };
-            const close = () => finish(null);
-            const use = () => finish(textarea.value);
+            const finishReject = (error) => {
+                if (settled) return;
+                settled = true;
+                removeAbortListener();
+                hidePopup(popup);
+                reject(error);
+            };
+            const close = () => finishReject(getAbortError(signal));
+            const use = () => finishResolve(textarea.value);
             removeAbortListener = bindAbortDismiss(signal, close);
 
             cancelBtn.onclick = close;
             useBtn.onclick = use;
-
             bindPopupDismiss(popup, close);
 
             textarea.onkeydown = (e) => {
@@ -11115,6 +12466,186 @@ function showPromptEditDialog(prompt, signal) {
             };
         }, { popupClass: "editor", contentClass: "qig-popup-content--editor", resizable: false });
     });
+}
+
+function showLLMRequestEditDialog(instruction, signal, options = {}) {
+    const title = String(options?.title || "Review Text AI Request");
+    const description = String(options?.description || "This is the complete request that will be sent to the Text AI.");
+    return new Promise((resolve, reject) => {
+        const popup = createPopup("qig-llm-request-edit-popup", title, `
+            <div class="qig-popup-form qig-prompt-edit-dialog">
+                <p class="qig-muted" style="margin:0 0 10px 0;">${escapeHtml(description)}</p>
+                <textarea id="qig-llm-request-edit-text" rows="16" placeholder="Edit the complete Text AI request..."></textarea>
+                <div class="qig-dialog-actions" style="margin-top:14px;">
+                    <button id="qig-llm-request-edit-cancel" class="menu_button">Cancel</button>
+                    <button id="qig-llm-request-edit-use" class="menu_button">Send Request</button>
+                </div>
+            </div>`, (popup) => {
+            const textarea = document.getElementById("qig-llm-request-edit-text");
+            textarea.value = instruction;
+            const cancelBtn = document.getElementById("qig-llm-request-edit-cancel");
+            const useBtn = document.getElementById("qig-llm-request-edit-use");
+
+            textarea.focus();
+            textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+
+            let settled = false;
+            let removeAbortListener = () => {};
+            const finishResolve = (value) => {
+                if (settled) return;
+                settled = true;
+                removeAbortListener();
+                hidePopup(popup);
+                resolve(value);
+            };
+            const finishReject = (error) => {
+                if (settled) return;
+                settled = true;
+                removeAbortListener();
+                hidePopup(popup);
+                reject(error);
+            };
+            const close = () => finishReject(getAbortError(signal));
+            const use = () => finishResolve(textarea.value);
+            removeAbortListener = bindAbortDismiss(signal, close);
+
+            cancelBtn.onclick = close;
+            useBtn.onclick = use;
+            bindPopupDismiss(popup, close);
+
+            textarea.onkeydown = (e) => {
+                if (e.key === "Enter" && e.ctrlKey) {
+                    e.preventDefault();
+                    use();
+                }
+                if (e.key === "Escape") {
+                    e.preventDefault();
+                    close();
+                }
+            };
+        }, { popupClass: "editor", contentClass: "qig-popup-content--editor", resizable: true });
+    });
+}
+
+function showFinalPromptReviewDialog(prompt, negative, signal, options = {}) {
+    return new Promise((resolve, reject) => {
+        const batchIndex = Number.isInteger(options?.batchIndex) ? options.batchIndex : null;
+        const batchCount = Number.isInteger(options?.batchCount) ? options.batchCount : null;
+        const suffix = batchCount && batchCount > 1 && batchIndex != null
+            ? ` (${batchIndex + 1}/${batchCount})`
+            : "";
+        const popup = createPopup("qig-final-prompt-edit-popup", `Review Final Image Prompt${suffix}`, `
+            <div class="qig-popup-form qig-prompt-edit-dialog">
+                <p class="qig-muted" style="margin:0 0 10px 0;">These are the prompts that will be passed to the selected image provider.</p>
+                <label for="qig-final-prompt-edit-positive" style="display:block;margin-bottom:6px;">Positive prompt</label>
+                <textarea id="qig-final-prompt-edit-positive" rows="10" placeholder="Edit the final positive prompt..."></textarea>
+                <label for="qig-final-prompt-edit-negative" style="display:block;margin:12px 0 6px;">Negative prompt</label>
+                <textarea id="qig-final-prompt-edit-negative" rows="6" placeholder="Edit the final negative prompt..."></textarea>
+                <div class="qig-dialog-actions" style="margin-top:14px;">
+                    <button id="qig-final-prompt-edit-cancel" class="menu_button">Cancel</button>
+                    <button id="qig-final-prompt-edit-use" class="menu_button">Generate Image</button>
+                </div>
+            </div>`, (popup) => {
+            const positiveEl = document.getElementById("qig-final-prompt-edit-positive");
+            const negativeEl = document.getElementById("qig-final-prompt-edit-negative");
+            const cancelBtn = document.getElementById("qig-final-prompt-edit-cancel");
+            const useBtn = document.getElementById("qig-final-prompt-edit-use");
+            positiveEl.value = prompt;
+            negativeEl.value = negative;
+
+            positiveEl.focus();
+            positiveEl.setSelectionRange(positiveEl.value.length, positiveEl.value.length);
+
+            let settled = false;
+            let removeAbortListener = () => {};
+            const finishResolve = (value) => {
+                if (settled) return;
+                settled = true;
+                removeAbortListener();
+                hidePopup(popup);
+                resolve(value);
+            };
+            const finishReject = (error) => {
+                if (settled) return;
+                settled = true;
+                removeAbortListener();
+                hidePopup(popup);
+                reject(error);
+            };
+            const close = () => finishReject(getAbortError(signal));
+            const use = () => finishResolve({
+                prompt: positiveEl.value,
+                negative: negativeEl.value,
+            });
+            removeAbortListener = bindAbortDismiss(signal, close);
+
+            cancelBtn.onclick = close;
+            useBtn.onclick = use;
+            bindPopupDismiss(popup, close);
+
+            const onKeyDown = (e) => {
+                if (e.key === "Enter" && e.ctrlKey) {
+                    e.preventDefault();
+                    use();
+                }
+                if (e.key === "Escape") {
+                    e.preventDefault();
+                    close();
+                }
+            };
+            positiveEl.onkeydown = onKeyDown;
+            negativeEl.onkeydown = onKeyDown;
+        }, { popupClass: "editor", contentClass: "qig-popup-content--editor", resizable: true });
+    });
+}
+
+async function reviewFinalProviderPrompts(prompt, negative, signal, options = {}) {
+    const settings = options?.settings || activeGenerationRun?.settings || getSettings();
+    const positiveTemplate = getQigApiTemplate(settings, "imageProviderPositiveTemplate");
+    const negativeTemplate = getQigApiTemplate(settings, "imageProviderNegativeTemplate");
+    const templateContext = options?.templateContext;
+    let templatedPrompt;
+    let templatedNegative;
+
+    if (templateContext) {
+        const resolved = await resolveQigProviderPromptTemplates({
+            settings,
+            positiveTemplate,
+            negativeTemplate,
+            basePrompt: templateContext.basePrompt,
+            baseNegative: templateContext.baseNegative,
+            context: templateContext.context,
+            matchedFilters: templateContext.matchedFilters,
+            alreadyFinal: false,
+        });
+        templatedPrompt = resolved.prompt;
+        templatedNegative = resolved.negative;
+    } else {
+        if (isDefaultQigApiTemplate(settings, "imageProviderPositiveTemplate") && isDefaultQigApiTemplate(settings, "imageProviderNegativeTemplate")) {
+            templatedPrompt = String(prompt ?? "");
+            templatedNegative = String(negative ?? "");
+            if (isGenerating || activeGenerationRun) {
+                recordQigLastGenerationMacroValues({
+                    qig_image_prompt: templatedPrompt,
+                    qig_negative_prompt: templatedNegative,
+                });
+            }
+        } else {
+            const macroValues = buildQigSourceDrivenMacroValues(settings, {
+                imagePrompt: String(prompt ?? ""),
+                negativePrompt: String(negative ?? ""),
+                providerAlreadyFinal: true,
+            });
+            templatedPrompt = expandWildcards(resolveQigApiTextTemplate(positiveTemplate, macroValues).replace(/\r?\n$/, ""));
+            templatedNegative = expandWildcards(resolveQigApiTextTemplate(negativeTemplate, macroValues).replace(/\r?\n$/, ""));
+        }
+    }
+
+    const reviewed = await showFinalPromptReviewDialog(templatedPrompt, templatedNegative, signal, options);
+    return {
+        prompt: String(reviewed?.prompt ?? ""),
+        negative: String(reviewed?.negative ?? ""),
+    };
 }
 
 function showPlainDescriptionDialog() {
@@ -11956,7 +13487,7 @@ async function regenerateImage(effectiveRequest = lastEffectiveRequest, returnFo
         && (!sourceTargetSnapshot
             || (lastGenerationSourceMessageId && sourceTargetSnapshot.messageId !== lastGenerationSourceMessageId)
             || (lastGenerationSourceMessageSignature && sourceTargetSnapshot.signature !== lastGenerationSourceMessageSignature)))) {
-        showStatus("❌ The original source message changed; regeneration was cancelled");
+        log("Regeneration skipped because the original source message changed");
         return;
     }
     const run = beginGeneration({
@@ -11977,6 +13508,12 @@ async function regenerateImage(effectiveRequest = lastEffectiveRequest, returnFo
         checkAborted(cancelCheckpoint);
         if (batchCount <= 1) {
             showStatus("🔄 Regenerating...");
+            const reviewedPrompts = await reviewFinalProviderPrompts(lastPrompt, lastNegative, run.signal, {
+                batchIndex: 0,
+                batchCount: 1,
+            });
+            lastPrompt = reviewedPrompts.prompt;
+            lastNegative = reviewedPrompts.negative;
             const result = await generateForProvider(lastPrompt, lastNegative, s, run.signal, {
                 ...providerRuntimeOptions,
                 batchIndex: 0,
@@ -12004,12 +13541,22 @@ async function regenerateImage(effectiveRequest = lastEffectiveRequest, returnFo
             }
         } else {
             const baseSeed = generateRandomSeed();
+            const regenerationBasePrompt = lastPrompt;
+            const regenerationBaseNegative = lastNegative;
             const outcome = await collectBatchResults(batchCount, async (i) => {
                 checkAborted(cancelCheckpoint);
                 if (s.sequentialSeeds) setGenerationSeedValue(s, baseSeed + i);
                 showStatus(`🔄 Regenerating ${i + 1}/${batchCount}...`);
-                const expandedPrompt = expandWildcards(lastPrompt);
-                const expandedNegative = expandWildcards(lastNegative);
+                let expandedPrompt = expandWildcards(regenerationBasePrompt);
+                let expandedNegative = expandWildcards(regenerationBaseNegative);
+                const reviewedPrompts = await reviewFinalProviderPrompts(expandedPrompt, expandedNegative, run.signal, {
+                    batchIndex: i,
+                    batchCount,
+                });
+                expandedPrompt = reviewedPrompts.prompt;
+                expandedNegative = reviewedPrompts.negative;
+                lastPrompt = expandedPrompt;
+                lastNegative = expandedNegative;
                 const result = await generateForProvider(expandedPrompt, expandedNegative, s, run.signal, {
                     ...providerRuntimeOptions,
                     batchIndex: i,
@@ -12039,7 +13586,6 @@ async function regenerateImage(effectiveRequest = lastEffectiveRequest, returnFo
     } catch (e) {
         if (e.name === "AbortError") {
             log("Regeneration cancelled by user");
-            toastr.info("Generation cancelled");
         } else {
             showStatus(`❌ ${e.message}`);
             log(`Regenerate error: ${e.message}`);
@@ -14335,7 +15881,7 @@ function deleteSelectedComfyWorkflowPreset() {
 }
 
 // === Generation Presets ===
-const PRESET_KEYS = ["provider", "style", "width", "height", "steps", "cfgScale", "sampler", "seed", "prompt", "negativePrompt", "qualityTags", "appendQuality", "useLastMessage", "messageRange", "enableParagraphPicker", "useLLMPrompt", "llmPromptStyle", "llmPrefill", "llmCustomInstruction", "llmEditPrompt", "llmAddQuality", "llmAddLighting", "llmAddArtist", "twoStepPrompt", "twoStepInstruction", "batchCount", "sequentialSeeds"];
+const PRESET_KEYS = ["provider", "style", "width", "height", "steps", "cfgScale", "sampler", "seed", "prompt", "negativePrompt", "qualityTags", "appendQuality", "useLastMessage", "messageRange", "enableParagraphPicker", "useLLMPrompt", "llmPromptStyle", "llmPrefill", "llmCustomInstruction", "llmEditPrompt", "llmAddQuality", "llmAddLighting", "llmAddArtist", "twoStepPrompt", "batchCount", "sequentialSeeds"];
 const PROVIDER_PRESET_KEYS = Object.freeze({
     local: ["a1111Scheduler", "comfyScheduler", "a1111RestoreFaces", "a1111Tiling", "a1111Subseed", "a1111SubseedStrength"],
     nanobanana: ["nanobananaNbpMode", "nanobananaNbpPreset", "nanobananaNbpUseNegative", "nanobananaNbpCustomDirector", "nanobananaNbpCustomPrompt", "nanobananaExtraInstructions"],
@@ -14808,7 +16354,11 @@ function refreshAllUI(s) {
         "qig-context-media-every": "contextMediaEveryMessages",
         "qig-context-media-confidence": "contextMediaConfidence",
         "qig-context-media-insert-mode": "contextMediaInsertMode",
-        "qig-two-step-instruction": "twoStepInstruction",
+        "qig-template-text-ai-image": "textAiImagePromptTemplate",
+        "qig-template-text-ai-scene": "textAiSceneDescriptionTemplate",
+        "qig-template-text-ai-tag": "textAiMissingTagTemplate",
+        "qig-template-provider-positive": "imageProviderPositiveTemplate",
+        "qig-template-provider-negative": "imageProviderNegativeTemplate",
         "qig-background-mode": "backgroundMode",
         "qig-output-mode": "outputMode",
         "qig-manual-insert-target": "manualInsertTarget",
@@ -15808,8 +17358,8 @@ function bind(id, key, isNum = false, isCheckbox = false, onChange = null) {
     }
 }
 
-function bindCheckbox(id, key) {
-    return bind(id, key, false, true);
+function bindCheckbox(id, key, onChange = null) {
+    return bind(id, key, false, true, onChange);
 }
 
 function associateSettingsLabels(root = document.getElementById("qig-settings")) {
@@ -16009,6 +17559,8 @@ function createUI() {
     const injectOptionsExpanded = injectOptionsCollapsed ? "false" : "true";
     const advancedSettingsHidden = collapsed.advancedSettings ? "hidden" : "";
     const advancedSettingsExpanded = collapsed.advancedSettings ? "false" : "true";
+    const macroInspectorHidden = collapsed.macroInspector ? "hidden" : "";
+    const macroInspectorExpanded = collapsed.macroInspector ? "false" : "true";
     const setupPanelHidden = collapsed.setupPanel ? "hidden" : "";
     const setupPanelExpanded = collapsed.setupPanel ? "false" : "true";
     const promptSourceMode = derivePromptSource(s);
@@ -17053,12 +18605,91 @@ function createUI() {
                                 <span>Use two-step prompt pipeline for chat scenes</span>
                             </label>
                             <div id="qig-two-step-options" class="qig-dependent-panel" style="display:${s.twoStepPrompt ? "block" : "none"};margin-top:6px;">
-                                <small style="opacity:0.6;font-size:10px;">For chat-based direct generation, QIG first asks Text AI for a plain visual scene description, then converts that description through the selected LLM prompt style.</small>
-                                <label>Scene description instruction (optional)</label>
-                                <textarea id="qig-two-step-instruction" rows="3" style="width:100%;resize:vertical;" placeholder="Leave empty for the default visual summary instruction">${esc(s.twoStepInstruction || "")}</textarea>
-                                <small style="opacity:0.6;font-size:10px;">Supports {{scene}}, {{char}}, {{user}}, {{charDesc}}, and {{userDesc}}.</small>
+                                <small style="opacity:0.6;font-size:10px;">For chat-based direct generation, QIG first sends the complete Text AI — scene-description request configured under API Text Templates, then converts the returned description through the selected LLM prompt style.</small>
                             </div>
                         </div>
+                    </div>
+
+                    <div class="qig-subsection" id="qig-api-template-section" style="margin-top:12px;">
+                        <div class="qig-card-title">API Text Templates</div>
+                        <small class="qig-muted">These saved fields are the source of truth. QIG resolves their macros, places the resolved text in the existing review popup, and sends exactly the popup contents. No prompt text is appended after the popup.</small>
+
+                        <div class="qig-field" style="margin-top:10px;">
+                            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                                <label for="qig-template-text-ai-image">Text AI — image-prompt request</label>
+                                <button id="qig-reset-template-text-ai-image" type="button" class="menu_button">Reset</button>
+                            </div>
+                            <textarea id="qig-template-text-ai-image" rows="20" style="width:100%;resize:vertical;">${esc(getQigApiTemplate(s, "textAiImagePromptTemplate"))}</textarea>
+                            <small class="qig-muted">This is the complete source template for the image-prompt Text AI request. Runtime context is inserted through the visible <code>{{qig_...}}</code> macros. Timestamp, entropy, output-reference, and prefill macros insert their final runtime text directly.</small>
+                        </div>
+
+                        <div class="qig-field" style="margin-top:10px;">
+                            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                                <label for="qig-template-text-ai-scene">Text AI — scene-description request</label>
+                                <button id="qig-reset-template-text-ai-scene" type="button" class="menu_button">Reset</button>
+                            </div>
+                            <textarea id="qig-template-text-ai-scene" rows="16" style="width:100%;resize:vertical;">${esc(getQigApiTemplate(s, "textAiSceneDescriptionTemplate"))}</textarea>
+                            <small class="qig-muted">This is the only editable source for the two-step scene-description request. The visible macros supply scene and character context; the timestamp and request-marker macros insert their final runtime text directly.</small>
+                        </div>
+
+                        <div class="qig-field" style="margin-top:10px;">
+                            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                                <label for="qig-template-text-ai-tag">Text AI — missing-image-tag request</label>
+                                <button id="qig-reset-template-text-ai-tag" type="button" class="menu_button">Reset</button>
+                            </div>
+                            <textarea id="qig-template-text-ai-tag" rows="10" style="width:100%;resize:vertical;">${esc(getQigApiTemplate(s, "textAiMissingTagTemplate"))}</textarea>
+                            <small class="qig-muted">Complete missing-tag fallback request. Runtime values are limited to the visible inject-instruction, scene, and timestamp macros.</small>
+                        </div>
+
+                        <div class="qig-control-grid" style="margin-top:10px;">
+                            <div class="qig-field">
+                                <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                                    <label for="qig-style-prefix-text">Style prefix inserted by <code>{{qig_style_prefix}}</code></label>
+                                    <button id="qig-reset-style-prefix-text" type="button" class="menu_button">Reset</button>
+                                </div>
+                                <textarea id="qig-style-prefix-text" rows="3" style="width:100%;resize:vertical;">${esc(getQigStyleText(s, "prefix"))}</textarea>
+                            </div>
+                            <div class="qig-field">
+                                <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                                    <label for="qig-style-suffix-text">Style suffix inserted by <code>{{qig_style_suffix}}</code></label>
+                                    <button id="qig-reset-style-suffix-text" type="button" class="menu_button">Reset</button>
+                                </div>
+                                <textarea id="qig-style-suffix-text" rows="3" style="width:100%;resize:vertical;">${esc(getQigStyleText(s, "suffix"))}</textarea>
+                            </div>
+                        </div>
+
+                        <div class="qig-field" style="margin-top:10px;">
+                            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                                <label for="qig-template-provider-positive">Image provider — positive prompt</label>
+                                <button id="qig-reset-template-provider-positive" type="button" class="menu_button">Reset</button>
+                            </div>
+                            <textarea id="qig-template-provider-positive" rows="8" style="width:100%;resize:vertical;">${esc(getQigApiTemplate(s, "imageProviderPositiveTemplate"))}</textarea>
+                            <small class="qig-muted">All macros insert text only. <code>{{qig_quality_prefix}}</code>, <code>{{qig_style_prefix}}</code>, <code>{{qig_image_prompt}}</code>, <code>{{qig_style_suffix}}</code>, and the SillyTavern-style wrapper macros are resolved before the popup.</small>
+                        </div>
+
+                        <div class="qig-field" style="margin-top:10px;">
+                            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                                <label for="qig-template-provider-negative">Image provider — negative prompt</label>
+                                <button id="qig-reset-template-provider-negative" type="button" class="menu_button">Reset</button>
+                            </div>
+                            <textarea id="qig-template-provider-negative" rows="7" style="width:100%;resize:vertical;">${esc(getQigApiTemplate(s, "imageProviderNegativeTemplate"))}</textarea>
+                            <small class="qig-muted"><code>{{qig_negative_prompt}}</code> is the configured negative prompt. SillyTavern style text comes from its Style panel; contextual-filter text/removals come from the existing filter manager. The fully resolved result is shown in the popup before sending.</small>
+                        </div>
+
+                        <div class="qig-subsection qig-collapsible" id="qig-macro-inspector-section" style="margin-top:14px;">
+                            <button id="qig-macro-inspector-toggle" type="button" class="qig-collapsible__header qig-inline-collapsible" aria-expanded="${macroInspectorExpanded}" aria-controls="qig-macro-inspector-content">
+                                <span class="qig-card-title">Macro Inspector</span>
+                                <span class="qig-collapsible__icon fa-solid ${collapsed.macroInspector ? "fa-chevron-right" : "fa-chevron-down"}" aria-hidden="true"></span>
+                            </button>
+                            <div id="qig-macro-inspector-content" class="qig-collapsible__content" ${macroInspectorHidden}>
+                                <div style="display:flex;justify-content:flex-end;margin-top:8px;">
+                                    <button id="qig-refresh-macro-inspector" type="button" class="menu_button">Refresh values</button>
+                                </div>
+                                <small class="qig-muted">All supported macros are listed alphabetically and collapsed by default. Editable macros have one Text field and Reset button. Their Text may contain other listed macros. External and runtime macros show one read-only Content field. Scene values use the latest character message.</small>
+                                <div id="qig-macro-inspector-list" style="margin-top:10px;">${renderQigMacroInspector(s)}</div>
+                            </div>
+                        </div>
+
                     </div>
                     </div>
                     </div>
@@ -17368,6 +18999,7 @@ function createUI() {
     const createSection = setupPanel?.querySelector(".qig-flow-create");
     if (textAiRouting && createSection) createSection.appendChild(textAiRouting);
     associateSettingsLabels();
+    bindQigMacroInspector();
 
     document.getElementById("qig-generate-btn").onclick = () => runConfiguredPaletteGeneration();
     document.querySelectorAll(".qig-logs-btn").forEach(btn => {
@@ -17399,6 +19031,7 @@ function createUI() {
     setupQigCollapsibleSection("promptAdvanced", "qig-prompt-advanced-toggle", "qig-prompt-advanced-content");
     setupQigCollapsibleSection("injectOptions", "qig-inject-options-toggle", "qig-inject-options");
     setupQigCollapsibleSection("advancedSettings", "qig-advanced-settings-toggle", "qig-advanced-settings");
+    setupQigCollapsibleSection("macroInspector", "qig-macro-inspector-toggle", "qig-macro-inspector-content");
     setupSettingsSearch();
     bindQigKeyboardShortcuts();
     renderPresets();
@@ -17406,6 +19039,7 @@ function createUI() {
     renderComfyWorkflowPresets();
     renderContextualFilters();
     renderContextMediaSummary();
+    setupQigExplanationDisclosures(document.getElementById("qig-settings"));
 
     document.querySelectorAll(".qig-wizard-btn").forEach(btn => {
         btn.onclick = () => showSetupWizard();
@@ -17435,7 +19069,17 @@ function createUI() {
         syncGenerationPresetIndicators();
     };
     document.getElementById("qig-style").onchange = (e) => {
-        getSettings().style = e.target.value;
+        const settings = getSettings();
+        settings.style = e.target.value;
+        if (settings.stylePrefixOverride === null) {
+            const prefixField = document.getElementById("qig-style-prefix-text");
+            if (prefixField) prefixField.value = getQigStyleText(settings, "prefix");
+        }
+        if (settings.styleSuffixOverride === null) {
+            const suffixField = document.getElementById("qig-style-suffix-text");
+            if (suffixField) suffixField.value = getQigStyleText(settings, "suffix");
+        }
+        clearStyleCache();
         saveSettingsDebounced();
         syncGenerationPresetIndicators();
     };
@@ -18088,16 +19732,44 @@ function createUI() {
         updateQigStatusLine();
         syncGenerationPresetIndicators();
     };
-    bind("qig-llm-custom", "llmCustomInstruction");
+    const refreshImagePromptTemplateDefault = () => refreshDefaultQigApiTemplateField(
+        "textAiImagePromptTemplate",
+        "qig-template-text-ai-image"
+    );
+    bind("qig-llm-custom", "llmCustomInstruction", refreshImagePromptTemplateDefault);
     bindCheckbox("qig-llm-edit", "llmEditPrompt");
-    bindCheckbox("qig-llm-quality", "llmAddQuality");
-    bindCheckbox("qig-llm-lighting", "llmAddLighting");
-    bindCheckbox("qig-llm-artist", "llmAddArtist");
+    bindCheckbox("qig-llm-quality", "llmAddQuality", refreshImagePromptTemplateDefault);
+    bindCheckbox("qig-llm-lighting", "llmAddLighting", refreshImagePromptTemplateDefault);
+    bindCheckbox("qig-llm-artist", "llmAddArtist", refreshImagePromptTemplateDefault);
     bind("qig-llm-prefill", "llmPrefill");
+    bind("qig-template-text-ai-image", "textAiImagePromptTemplate");
+    bind("qig-template-text-ai-scene", "textAiSceneDescriptionTemplate");
+    bind("qig-template-text-ai-tag", "textAiMissingTagTemplate");
+    bind("qig-template-provider-positive", "imageProviderPositiveTemplate");
+    bind("qig-template-provider-negative", "imageProviderNegativeTemplate");
+    bind("qig-style-prefix-text", "stylePrefixOverride");
+    bind("qig-style-suffix-text", "styleSuffixOverride");
+    const stylePrefixReset = document.getElementById("qig-reset-style-prefix-text");
+    if (stylePrefixReset) stylePrefixReset.onclick = () => resetQigStyleTextField("prefix", "qig-style-prefix-text");
+    const styleSuffixReset = document.getElementById("qig-reset-style-suffix-text");
+    if (styleSuffixReset) styleSuffixReset.onclick = () => resetQigStyleTextField("suffix", "qig-style-suffix-text");
+
+    const apiTemplateResetBindings = [
+        ["qig-reset-template-text-ai-image", "textAiImagePromptTemplate", "qig-template-text-ai-image"],
+        ["qig-reset-template-text-ai-scene", "textAiSceneDescriptionTemplate", "qig-template-text-ai-scene"],
+        ["qig-reset-template-text-ai-tag", "textAiMissingTagTemplate", "qig-template-text-ai-tag"],
+        ["qig-reset-template-provider-positive", "imageProviderPositiveTemplate", "qig-template-provider-positive"],
+        ["qig-reset-template-provider-negative", "imageProviderNegativeTemplate", "qig-template-provider-negative"],
+    ];
+    for (const [buttonId, settingKey, fieldId] of apiTemplateResetBindings) {
+        const button = document.getElementById(buttonId);
+        if (button) button.onclick = () => resetQigApiTemplateField(settingKey, fieldId);
+    }
     document.getElementById("qig-llm-style").onchange = e => {
         getSettings().llmPromptStyle = e.target.value;
         saveSettingsDebounced();
         document.getElementById("qig-llm-custom-wrap").style.display = e.target.value === "custom" ? "block" : "none";
+        refreshImagePromptTemplateDefault();
         syncGenerationPresetIndicators();
     };
     bindAutoGenerateCheckbox("qig-auto-generate");
@@ -18126,7 +19798,6 @@ function createUI() {
             updateQigStatusLine();
         };
     }
-    bind("qig-two-step-instruction", "twoStepInstruction");
     const autoBackgroundEl = document.getElementById("qig-auto-background");
     if (autoBackgroundEl) {
         autoBackgroundEl.onchange = (e) => {
@@ -18751,7 +20422,24 @@ async function generateImageInjectPalette() {
             const sceneContext = getMessages(s, ctx) || resolvePrompt(s.prompt) || "the current scene";
             const injectInstruction = resolvePrompt(getInjectPromptTemplate(s));
             const timestamp = Date.now();
-            const fullInstruction = `${injectInstruction}\n\nBased on this scene context, generate exactly one image tag for the single best visual moment. You must use the exact tag format shown above. Return exactly one tag only. Do not generate multiple tags, lists, moments, or variants.\n\nScene context:\n${sceneContext}\n\nRespond with image tags only.\n\n[${timestamp}]`;
+            const generatedRequest = `${injectInstruction}\n\nBased on this scene context, generate exactly one image tag for the single best visual moment. You must use the exact tag format shown above. Return exactly one tag only. Do not generate multiple tags, lists, moments, or variants.\n\nScene context:\n${sceneContext}\n\nRespond with image tags only.\n\n[${timestamp}]`;
+            const missingTagTemplate = getQigApiTemplate(s, "textAiMissingTagTemplate");
+            let fullInstruction = resolveQigApiTextTemplate(
+                missingTagTemplate,
+                {
+                    qig_inject_instruction: injectInstruction,
+                    qig_scene: sceneContext,
+                    qig_timestamp: timestamp,
+                }
+            );
+            if (isDefaultQigApiTemplate(s, "textAiMissingTagTemplate") && fullInstruction !== generatedRequest) {
+                throw new Error("Default missing-tag template did not reproduce the index3 request exactly");
+            }
+            fullInstruction = await showLLMRequestEditDialog(fullInstruction, run.signal, {
+                title: "Review Missing Image Tag Request",
+                description: "This is the complete request that will be sent to the Text AI to generate one missing image tag.",
+            });
+            checkAborted(cancelCheckpoint);
 
             let llmResponse;
             if (s.llmOverrideEnabled && s.llmOverrideProfileId) {
@@ -18816,7 +20504,9 @@ async function generateImageInjectPalette() {
                     if (editedPrompt !== null) prompt = editedPrompt;
                     else continue;
                 }
-                let negative = resolvePrompt(s.negativePrompt);
+                const providerTemplateBasePrompt = prompt;
+                const providerTemplateBaseNegative = resolvePrompt(s.negativePrompt);
+                let negative = providerTemplateBaseNegative;
                 prompt = applyStyle(prompt, s);
 
                 if (s.appendQuality && s.qualityTags) {
@@ -18849,8 +20539,22 @@ async function generateImageInjectPalette() {
                     checkAborted(cancelCheckpoint);
                     setGenerationSeedValue(s, useSequentialSeeds ? baseSeed + i : baseSeed);
                     showStatus(`🖼️ Generating palette-inject image ${i + 1}/${batchCount}...`);
-                    const expandedPrompt = expandWildcards(prompt);
-                    const expandedNegative = expandWildcards(negative);
+                    let expandedPrompt = prompt;
+                    let expandedNegative = negative;
+                    const reviewedPrompts = await reviewFinalProviderPrompts(expandedPrompt, expandedNegative, run.signal, {
+                        batchIndex: i,
+                        batchCount,
+                        templateContext: {
+                            basePrompt: providerTemplateBasePrompt,
+                            baseNegative: providerTemplateBaseNegative,
+                            context: ctx,
+                            matchedFilters: contextualApplied.matchedFilters,
+                        },
+                    });
+                    expandedPrompt = reviewedPrompts.prompt;
+                    expandedNegative = reviewedPrompts.negative;
+                    lastPrompt = expandedPrompt;
+                    lastNegative = expandedNegative;
                     const result = await generateForProvider(expandedPrompt, expandedNegative, s, run.signal, { batchIndex: i, batchCount });
                     if (result) {
                         return await finalizeGeneratedResults(result, expandedPrompt, expandedNegative, s, getGenerationFinalizationOptions(run, {
@@ -18893,7 +20597,6 @@ async function generateImageInjectPalette() {
     } catch (e) {
         if (e.name === "AbortError") {
             log("Palette inject: Generation cancelled by user");
-            toastr.info("Generation cancelled");
             return { status: "cancelled", generated: generatedCount, failed: failedCount };
         } else {
             log(`Palette inject: Error: ${e.message}`);
@@ -18984,12 +20687,14 @@ async function generateImageFromPlainDescription() {
             }
         }
 
+        const providerTemplateBasePrompt = prompt;
+        const providerTemplateBaseNegative = resolvePrompt(s.negativePrompt);
         prompt = applyStyle(prompt, s);
 
         if (s.appendQuality && s.qualityTags) {
             prompt = `${s.qualityTags}, ${prompt}`;
         }
-        let negative = resolvePrompt(s.negativePrompt);
+        let negative = providerTemplateBaseNegative;
 
         if (s.useSTStyle !== false) {
             ({ prompt, negative } = applySTStylePrompts(prompt, negative, ctx));
@@ -19020,8 +20725,22 @@ async function generateImageFromPlainDescription() {
             checkAborted(cancelCheckpoint);
             setGenerationSeedValue(s, useSequentialSeeds ? baseSeed + i : baseSeed);
             showStatus(`🖼️ Generating image ${i + 1}/${batchCount}...`);
-            const expandedPrompt = expandWildcards(prompt);
-            const expandedNegative = expandWildcards(negative);
+            let expandedPrompt = prompt;
+            let expandedNegative = negative;
+            const reviewedPrompts = await reviewFinalProviderPrompts(expandedPrompt, expandedNegative, run.signal, {
+                batchIndex: i,
+                batchCount,
+                templateContext: {
+                    basePrompt: providerTemplateBasePrompt,
+                    baseNegative: providerTemplateBaseNegative,
+                    context: ctx,
+                    matchedFilters: contextualApplied.matchedFilters,
+                },
+            });
+            expandedPrompt = reviewedPrompts.prompt;
+            expandedNegative = reviewedPrompts.negative;
+            lastPrompt = expandedPrompt;
+            lastNegative = expandedNegative;
             const result = await generateForProvider(expandedPrompt, expandedNegative, s, run.signal, { batchIndex: i, batchCount });
             if (result) {
                 return await finalizeGeneratedResults(result, expandedPrompt, expandedNegative, s, getGenerationFinalizationOptions(run, {
@@ -19072,7 +20791,6 @@ async function generateImageFromPlainDescription() {
     } catch (e) {
         if (e.name === "AbortError") {
             log("Plain description generation cancelled by user");
-            toastr.info("Generation cancelled");
         } else {
             log(`Plain description error: ${e.message}`);
             toastr.error("Plain description generation failed: " + e.message, "", { timeOut: 0, extendedTimeOut: 0, closeButton: true, escapeHtml: true });
@@ -19212,12 +20930,14 @@ async function generateImage() {
         }
     }
 
+    const providerTemplateBasePrompt = prompt;
+    const providerTemplateBaseNegative = resolvePrompt(s.negativePrompt);
     prompt = applyStyle(prompt, s);
 
     if (s.appendQuality && s.qualityTags) {
         prompt = `${s.qualityTags}, ${prompt}`;
     }
-    let negative = resolvePrompt(s.negativePrompt);
+    let negative = providerTemplateBaseNegative;
 
     // Apply ST Style panel settings (prefix, char-specific, negative)
     if (s.useSTStyle !== false) {
@@ -19252,8 +20972,22 @@ async function generateImage() {
                 checkAborted(cancelCheckpoint);
                 setGenerationSeedValue(s, useSequentialSeeds ? baseSeed + i : baseSeed);
                 showStatus(`🖼️ Generating image ${i + 1}/${batchCount}...`);
-                const expandedPrompt = expandWildcards(prompt);
-                const expandedNegative = expandWildcards(negative);
+                let expandedPrompt = prompt;
+                let expandedNegative = negative;
+                const reviewedPrompts = await reviewFinalProviderPrompts(expandedPrompt, expandedNegative, run.signal, {
+                    batchIndex: i,
+                    batchCount,
+                    templateContext: {
+                        basePrompt: providerTemplateBasePrompt,
+                        baseNegative: providerTemplateBaseNegative,
+                        context: ctx,
+                        matchedFilters: contextualApplied.matchedFilters,
+                    },
+                });
+                expandedPrompt = reviewedPrompts.prompt;
+                expandedNegative = reviewedPrompts.negative;
+                lastPrompt = expandedPrompt;
+                lastNegative = expandedNegative;
                 const result = await generateForProvider(expandedPrompt, expandedNegative, s, run.signal, {
                     ...providerRuntimeOptions,
                     batchIndex: i,
@@ -19320,7 +21054,6 @@ async function generateImage() {
     } catch (e) {
         if (e.name === "AbortError") {
             log("Generation cancelled by user");
-            toastr.info("Generation cancelled");
             return { status: "cancelled", generated: 0, failed: 0 };
         } else {
             log(`Error: ${e.message}`);
@@ -19813,7 +21546,9 @@ async function processInjectMessage(messageText, messageIndex, job = null) {
                         continue;
                     }
                 }
-                let negative = resolvePrompt(s.negativePrompt);
+                const providerTemplateBasePrompt = prompt;
+                const providerTemplateBaseNegative = resolvePrompt(s.negativePrompt);
+                let negative = providerTemplateBaseNegative;
 
                 // Apply style
                 prompt = applyStyle(prompt, s);
@@ -19850,8 +21585,22 @@ async function processInjectMessage(messageText, messageIndex, job = null) {
                     checkAborted(cancelCheckpoint);
                     setGenerationSeedValue(s, useSequentialSeeds ? baseSeed + i : baseSeed);
                     showStatus(`🖼️ Generating inject image ${i + 1}/${batchCount}...`);
-                    const expandedPrompt = expandWildcards(prompt);
-                    const expandedNegative = expandWildcards(negative);
+                    let expandedPrompt = prompt;
+                    let expandedNegative = negative;
+                    const reviewedPrompts = await reviewFinalProviderPrompts(expandedPrompt, expandedNegative, run.signal, {
+                        batchIndex: i,
+                        batchCount,
+                        templateContext: {
+                            basePrompt: providerTemplateBasePrompt,
+                            baseNegative: providerTemplateBaseNegative,
+                            context: ctx,
+                            matchedFilters: contextualApplied.matchedFilters,
+                        },
+                    });
+                    expandedPrompt = reviewedPrompts.prompt;
+                    expandedNegative = reviewedPrompts.negative;
+                    lastPrompt = expandedPrompt;
+                    lastNegative = expandedNegative;
                     const result = await generateForProvider(expandedPrompt, expandedNegative, s, run.signal, { batchIndex: i, batchCount });
                     if (result) {
                         return await finalizeGeneratedResults(result, expandedPrompt, expandedNegative, s, getGenerationFinalizationOptions(run, {
@@ -19882,8 +21631,7 @@ async function processInjectMessage(messageText, messageIndex, job = null) {
             } catch (e) {
                 if (e.name === "AbortError") {
                     log("Inject: Generation cancelled by user");
-                    toastr.info("Generation cancelled");
-                    break; // Exit the entire match loop on cancel
+                            break; // Exit the entire match loop on cancel
                 } else {
                     log(`Inject: Generation error: ${e.message}`);
                     toastr.error("Inject generation failed: " + e.message, "", { timeOut: 0, extendedTimeOut: 0, closeButton: true, escapeHtml: true });
@@ -19970,7 +21718,7 @@ async function runQigSlashGenerateCommand(args = {}, unnamedPrompt = "") {
             outcome = await runGeneration();
         }
         if (outcome?.status === "busy") return "QIG: generation is already running.";
-        if (outcome?.status === "cancelled") return "QIG: generation cancelled.";
+        if (outcome?.status === "cancelled") return "";
         if (outcome?.status === "failed") return `QIG failed: ${outcome.message || "generation failed"}`;
         if (outcome?.status === "partial") return `QIG: generated ${outcome.generated} image(s); ${outcome.failed} generation(s) failed.`;
         return `QIG: generation complete${Number.isInteger(outcome?.generated) ? ` (${outcome.generated} image(s))` : ""}.`;

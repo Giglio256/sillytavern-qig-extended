@@ -647,7 +647,9 @@ function enhanceQigExplanationElement(element) {
     const summary = document.createElement("summary");
     summary.style.cursor = "pointer";
     summary.style.listStyle = "none";
-    summary.style.display = "block";
+    summary.style.display = "flex";
+    summary.style.alignItems = "center";
+    summary.style.gap = "8px";
     summary.textContent = split.first;
 
     const body = document.createElement("div");
@@ -666,7 +668,19 @@ function ensureQigExplanationDisclosureStyles() {
     style.id = "qig-explanation-disclosure-styles";
     style.textContent = `.qig-explanation-disclosure > summary { list-style: none; }
 .qig-explanation-disclosure > summary::-webkit-details-marker { display: none; }
-.qig-explanation-disclosure > summary::marker { content: ""; }`;
+.qig-explanation-disclosure > summary::marker { content: ""; }
+.qig-explanation-disclosure > summary::after {
+    content: "";
+    width: 0.45em;
+    height: 0.45em;
+    margin-left: auto;
+    flex: 0 0 auto;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(45deg);
+    transition: transform 120ms ease;
+}
+.qig-explanation-disclosure[open] > summary::after { transform: rotate(-135deg); }`;
     document.head.appendChild(style);
 }
 

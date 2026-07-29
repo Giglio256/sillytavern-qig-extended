@@ -8,6 +8,7 @@ import {
     getWorldInfoContextBudget,
     normalizeWorldInfoRecords,
     resolveWorldInfoContext,
+    summarizeWorldInfoResult,
 } from "../lib/world-info-context.js";
 
 test("normalizes SillyTavern 1.14 buckets in stable slot and insertion order", () => {
@@ -204,6 +205,15 @@ test("resolves World Info with one dry-run call and returns normalized text", as
     assert.deepEqual(context, {
         records: [{ slot: "before", content: "before lore" }],
         text: "=== World Info ===\n\n[Before]\nbefore lore",
+        resultSummary: {
+            worldInfoBefore: { present: true, contentLength: 11 },
+            worldInfoAfter: { present: false, contentLength: 0 },
+            exampleEntries: { count: 0, contentLength: 0 },
+            authorsNoteBeforeEntries: { count: 0, contentLength: 0 },
+            authorsNoteAfterEntries: { count: 0, contentLength: 0 },
+            depthEntries: { groupCount: 0, count: 0, contentLength: 0 },
+            outletEntries: { outletCount: 0, count: 0, contentLength: 0 },
+        },
     });
 });
 
@@ -216,4 +226,44 @@ test("fails clearly when the injected World Info API is unavailable", async () =
         resolveWorldInfoContext({ checkWorldInfo: null }),
         /checkWorldInfo dependency is required/,
     );
+});
+
+
+test("summarizes World Info buckets without retaining names or contents", () => {
+    const summary = summarizeWorldInfoResult({
+        worldInfoBefore: "secret before",
+        worldInfoAfter: "",
+        EMEntries: [{ position: 0, content: "example secret" }],
+        ANBeforeEntries: ["note secret"],
+        ANAfterEntries: [],
+        WIDepthEntries: [{ depth: 3, role: 1, entries: ["depth one", "depth two"] }],
+        outletEntries: { privateOutletName: ["outlet secret"] },
+    });
+    const serialized = JSON.stringify(summary);
+
+    assert.deepEqual(summary, {
+        worldInfoBefore: { present: true, contentLength: 13 },
+        worldInfoAfter: { present: false, contentLength: 0 },
+        exampleEntries: { count: 1, contentLength: 14 },
+        authorsNoteBeforeEntries: { count: 1, contentLength: 11 },
+        authorsNoteAfterEntries: { count: 0, contentLength: 0 },
+        depthEntries: { groupCount: 1, count: 2, contentLength: 18 },
+        outletEntries: { outletCount: 1, count: 1, contentLength: 13 },
+    });
+    assert.equal(serialized.includes("secret"), false);
+    assert.equal(serialized.includes("privateOutletName"), false);
+});
+
+test("can optionally return the raw World Info result for full diagnostics", async () => {
+    const rawResult = { worldInfoBefore: "raw lore" };
+    const context = await resolveWorldInfoContext({
+        checkWorldInfo: async () => rawResult,
+        chat: ["scene"],
+        maxContext: 2048,
+        globalScanData: {},
+        includeRawResult: true,
+    });
+
+    assert.equal(context.rawResult, rawResult);
+    assert.equal(context.resultSummary.worldInfoBefore.contentLength, 8);
 });

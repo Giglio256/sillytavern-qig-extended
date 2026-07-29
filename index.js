@@ -198,7 +198,13 @@ import {
     shouldCleanInjectSourceTags,
 } from "./lib/generation-semantics.js";
 import { createLifecycleScope } from "./lib/lifecycle.js";
-import { PrivacyLogBuffer } from "./lib/privacy-log.js";
+import {
+    buildDiagnosticReport,
+    DiagnosticEventBuffer,
+    normalizeDiagnosticsMode,
+    PrivacyLogBuffer,
+    utf8ByteLength,
+} from "./lib/privacy-log.js";
 import {
     createAccessibleIconButton,
     resolveMainGenerationControlState,
@@ -1193,6 +1199,8 @@ const defaultSettings = {
     reviewBeforeGenerate: false,
     preserveCharacterIdentity: true,
     useWorldInfo: false,
+    diagnosticsEnabled: false,
+    diagnosticsAnonymize: true,
     llmAddQuality: false,
     llmAddLighting: false,
     llmAddArtist: false,
@@ -3222,8 +3230,14 @@ const A1111_SCHEDULERS = ["Automatic", "Uniform", "Karras", "Exponential", "Poly
 
 const COMFY_SCHEDULERS = ["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta", "kl_optimal"];
 
+const QIG_DIAGNOSTIC_VERSION = "2.9.0";
 const logs = new PrivacyLogBuffer();
-let debugLoggingEnabled = false;
+const diagnosticEvents = new DiagnosticEventBuffer();
+
+function getDiagnosticsMode(settings = getSettings?.()) {
+    if (!settings?.diagnosticsEnabled) return "off";
+    return settings.diagnosticsAnonymize === false ? "full" : "privacy";
+}
 
 function writeLog(msg, options) {
     const result = logs.append(msg, options);
@@ -3235,7 +3249,34 @@ function log(msg) {
 }
 
 function debugLog(msg) {
-    writeLog(msg, { diagnostic: true, debugEnabled: debugLoggingEnabled });
+    writeLog(msg, { diagnostic: true, debugEnabled: getDiagnosticsMode() === "full" });
+}
+
+function writeDiagnosticEvent(event, details = {}, fullDetails = {}) {
+    return diagnosticEvents.append(event, {
+        mode: getDiagnosticsMode(),
+        details,
+        fullDetails,
+    });
+}
+
+function getDiagnosticGlobalScanFieldLengths(globalScanData) {
+    return Object.fromEntries(Object.entries(globalScanData || {}).map(([key, value]) => [key, String(value ?? "").length]));
+}
+
+function writeWorldInfoRequestDiagnostic(stage, requestText, worldInfoText) {
+    const worldInfo = String(worldInfoText || "");
+    if (!worldInfo) return;
+    const request = String(requestText || "");
+    writeDiagnosticEvent("world_info_text_ai_request", {
+        route: String(stage || "text-ai-request"),
+        requestLength: request.length,
+        formattedTextLength: worldInfo.length,
+        insertedIntoTextAIContext: request.includes(worldInfo),
+    }, {
+        requestText: request,
+        formattedWorldInfoText: worldInfo,
+    });
 }
 
 function parseFloatOr(value, fallback) {
@@ -4169,6 +4210,16 @@ async function loadSettings() {
         if (saved.starterPresetsSeeded === undefined) s.starterPresetsSeeded = true;
     }
     s.paletteMode = normalizePaletteMode(s.paletteMode);
+    const legacyDiagnosticsMode = normalizeDiagnosticsMode(saved?.diagnosticsMode);
+    if (saved?.diagnosticsEnabled === undefined && saved?.diagnosticsMode !== undefined) {
+        s.diagnosticsEnabled = legacyDiagnosticsMode !== "off";
+    }
+    if (saved?.diagnosticsAnonymize === undefined && saved?.diagnosticsMode !== undefined) {
+        s.diagnosticsAnonymize = legacyDiagnosticsMode !== "full";
+    }
+    s.diagnosticsEnabled = !!s.diagnosticsEnabled;
+    s.diagnosticsAnonymize = s.diagnosticsAnonymize !== false;
+    delete s.diagnosticsMode;
     const savedTagName = getInjectTagName(saved);
     s.injectTagName = savedTagName;
     // Migrate old messageIndex to messageRange
@@ -6714,8 +6765,18 @@ async function resolveWorldInfoForPromptPipeline(settings, {
     sourceText = "",
     signal = null,
     forceTextAI = false,
+    route = "unspecified",
 } = {}) {
-    if (!settings?.useWorldInfo || (!settings?.useLLMPrompt && !forceTextAI)) {
+    const worldInfoEnabled = !!settings?.useWorldInfo;
+    const textAIEnabled = !!settings?.useLLMPrompt || !!forceTextAI;
+    if (!worldInfoEnabled || !textAIEnabled) {
+        writeDiagnosticEvent("world_info_skipped", {
+            route,
+            reason: !worldInfoEnabled ? "world-info-disabled" : "text-ai-disabled",
+            worldInfoEnabled,
+            textAIEnabled,
+            forceTextAI: !!forceTextAI,
+        });
         return { records: [], text: "" };
     }
     const chat = Array.isArray(context?.chat) ? context.chat : [];
@@ -6723,7 +6784,8 @@ async function resolveWorldInfoForPromptPipeline(settings, {
 
     try {
         const includeNames = hostWorldInfoModule?.world_info_include_names !== false;
-        const scanChat = Number.isInteger(throughIndex) && chat.length
+        const usesStoredChat = Number.isInteger(throughIndex) && chat.length > 0;
+        const scanChat = usesStoredChat
             ? buildWorldInfoScanChat(chat, throughIndex, (message) => {
                 const source = resolveSceneMessageSource(message);
                 return formatWorldInfoScanMessage(message, {
@@ -6733,19 +6795,85 @@ async function resolveWorldInfoForPromptPipeline(settings, {
                 });
             })
             : (explicitSource ? [explicitSource] : []);
-        if (!scanChat.length) return { records: [], text: "" };
+        writeDiagnosticEvent("world_info_scan_prepared", {
+            route,
+            sourceType: usesStoredChat ? "stored-chat" : "explicit-source",
+            throughIndex: Number.isInteger(throughIndex) ? throughIndex : null,
+            availableChatCount: chat.length,
+            explicitSourceLength: explicitSource.length,
+            scanItemCount: scanChat.length,
+            scanItemLengths: scanChat.map(item => String(item).length),
+            scanItemByteLengths: scanChat.map(item => utf8ByteLength(item)),
+            includeNames,
+        }, {
+            scanChat,
+            explicitSource,
+        });
+        if (!scanChat.length) {
+            writeDiagnosticEvent("world_info_skipped", {
+                route,
+                reason: "empty-scan-input",
+                worldInfoEnabled,
+                textAIEnabled,
+                forceTextAI: !!forceTextAI,
+                scanItemCount: 0,
+            });
+            return { records: [], text: "" };
+        }
         const maxContext = getWorldInfoContextBudget(hostScriptModule);
+        const globalScanData = buildWorldInfoGlobalScanData(context);
+        writeDiagnosticEvent("world_info_check_started", {
+            route,
+            checkWorldInfoAvailable: typeof (hostWorldInfoModule?.checkWorldInfo || checkWorldInfo) === "function",
+            maxContext,
+            includeNames,
+            globalScanFieldLengths: getDiagnosticGlobalScanFieldLengths(globalScanData),
+        }, {
+            globalScanData,
+        });
+        const startedAt = globalThis.performance?.now?.() ?? Date.now();
         const resolved = await runSerializedTextAITask(() => resolveWorldInfoContext({
             checkWorldInfo: hostWorldInfoModule?.checkWorldInfo || checkWorldInfo,
             chat: scanChat,
             maxContext,
-            globalScanData: buildWorldInfoGlobalScanData(context),
+            globalScanData,
+            includeRawResult: getDiagnosticsMode() === "full",
         }), signal);
+        const finishedAt = globalThis.performance?.now?.() ?? Date.now();
         if (signal?.aborted) throw getAbortError(signal);
+        const { rawResult, ...publicResolved } = resolved;
+        writeDiagnosticEvent("world_info_check_completed", {
+            route,
+            durationMs: Math.max(0, Math.round(finishedAt - startedAt)),
+            resultSummary: resolved.resultSummary || {},
+            normalizedRecordCount: resolved.records.length,
+            formattedTextLength: resolved.text.length,
+            hasFormattedText: !!resolved.text,
+        }, {
+            rawResult,
+            normalizedRecords: resolved.records,
+            formattedWorldInfoText: resolved.text,
+        });
         if (resolved.text) log(`World Info: Added ${resolved.records.length} matched placement record(s) to visible Text AI context`);
-        return resolved;
+        return publicResolved;
     } catch (error) {
-        if (error?.name === "AbortError") throw error;
+        if (error?.name === "AbortError") {
+            writeDiagnosticEvent("world_info_check_failed", {
+                route,
+                aborted: true,
+                errorType: "AbortError",
+            });
+            throw error;
+        }
+        writeDiagnosticEvent("world_info_check_failed", {
+            route,
+            aborted: false,
+            errorType: String(error?.name || "Error"),
+            errorCode: String(error?.code || ""),
+        }, {
+            errorMessage: String(error?.message || error),
+            errorStack: String(error?.stack || ""),
+        });
         log(`World Info context unavailable: ${error.message}`);
         toastr?.warning?.(
             "Matched World Info could not be resolved, so this request will continue without lore context.",
@@ -7739,6 +7867,7 @@ async function generateSceneDescription(s, sceneText, signal, options = {}) {
             getQigApiTemplate(s, "textAiSceneDescriptionTemplate"),
             runtime.values,
         );
+        writeWorldInfoRequestDiagnostic("scene-summary-request", instructionWithEntropy, options.worldInfoText);
 
         if (s.reviewBeforeGenerate || !!options.worldInfoText) {
             const reviewed = await reviewTextAIRequest(instructionWithEntropy, {
@@ -7824,6 +7953,7 @@ async function generateLLMPrompt(s, basePrompt, signal, options = {}) {
             getQigApiTemplate(s, "textAiImagePromptTemplate"),
             runtime.values,
         );
+        writeWorldInfoRequestDiagnostic("image-prompt-request", instructionWithEntropy, options.worldInfoText);
 
         log(`LLM scene mode: ${isMultiMessage ? "multi-message transcript" : "single-message scene"} (${String(basePrompt || "").length} chars)`);
         log(`Sending instruction to LLM (length: ${instructionWithEntropy.length} chars)`);
@@ -10085,10 +10215,139 @@ function createPopup(id, title, content, onShow, options = {}) {
     return popup;
 }
 
-function showLogs() {
-    createPopup("qig-logs-popup", "Generation Logs", `<pre id="qig-logs-content"></pre>`, (popup) => {
-        document.getElementById("qig-logs-content").textContent = logs.join("\n") || "No logs yet";
+function diagnosticFilenameTimestamp(date = new Date()) {
+    return date.toISOString().replace(/[:.]/g, "-");
+}
+
+function formatDiagnosticEventForDisplay(entry) {
+    const timestamp = String(entry?.timestamp || "");
+    const time = timestamp ? new Date(timestamp).toLocaleTimeString() : "";
+    const heading = `${time ? `[${time}] ` : ""}${String(entry?.event || "diagnostic_event")}`;
+    const details = entry?.details && typeof entry.details === "object"
+        ? Object.entries(entry.details).map(([key, value]) => {
+            const text = value && typeof value === "object" ? JSON.stringify(value) : String(value);
+            return `  ${key}: ${text}`;
+        })
+        : [];
+    return [heading, ...details].join("\n");
+}
+
+function downloadDiagnosticReport() {
+    const mode = getDiagnosticsMode();
+    if (mode === "off") {
+        toastr?.warning?.("Enable diagnostics and run a generation before exporting.");
+        return;
+    }
+    const generatedAt = new Date();
+    const report = buildDiagnosticReport({
+        mode,
+        events: diagnosticEvents.entries,
+        logs: logs.entries,
+        generatedAt,
+        metadata: {
+            reportSchemaVersion: 1,
+            qigVersion: QIG_DIAGNOSTIC_VERSION,
+            diagnosticsMode: mode,
+            eventCount: diagnosticEvents.entries.length,
+            eventBytes: diagnosticEvents.totalBytes,
+            logCount: logs.entries.length,
+            logBytes: logs.totalBytes,
+        },
     });
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `qig-diagnostics-${diagnosticFilenameTimestamp(generatedAt)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    toastr?.success?.("Diagnostic report exported");
+}
+
+function showLogs() {
+    createPopup("qig-logs-popup", "Generation Logs", `
+        <div class="qig-logs-body">
+            <div class="qig-logs-options">
+                <label class="qig-logs-toggle">
+                    <input id="qig-diagnostics-enabled" type="checkbox">
+                    <span>Enable diagnostics</span>
+                </label>
+                <label class="qig-logs-toggle">
+                    <input id="qig-diagnostics-anonymize" type="checkbox">
+                    <span>Hide sensitive content</span>
+                </label>
+            </div>
+            <pre id="qig-logs-content" aria-live="polite"></pre>
+            <div class="qig-popup-actions">
+                <button id="qig-logs-clear" type="button" class="menu_button">Clear</button>
+                <button id="qig-logs-export" type="button" class="menu_button">Export</button>
+            </div>
+        </div>
+    `, (popup) => {
+        const enabledInput = popup.querySelector("#qig-diagnostics-enabled");
+        const anonymizeInput = popup.querySelector("#qig-diagnostics-anonymize");
+        const content = popup.querySelector("#qig-logs-content");
+        const exportButton = popup.querySelector("#qig-logs-export");
+
+        const render = () => {
+            const settings = getSettings();
+            const mode = getDiagnosticsMode(settings);
+            enabledInput.checked = !!settings.diagnosticsEnabled;
+            anonymizeInput.checked = settings.diagnosticsAnonymize !== false;
+            anonymizeInput.disabled = !settings.diagnosticsEnabled;
+            anonymizeInput.closest(".qig-logs-toggle")?.classList.toggle("qig-logs-toggle--disabled", anonymizeInput.disabled);
+            exportButton.disabled = mode === "off";
+
+            if (mode === "off") {
+                content.textContent = logs.entries.join("\n") || "No logs yet";
+                return;
+            }
+            const entries = diagnosticEvents.entries;
+            content.textContent = entries.length
+                ? entries.map(formatDiagnosticEventForDisplay).join("\n\n")
+                : "Diagnostics are enabled. Run a generation to capture data.";
+        };
+
+        enabledInput.onchange = () => {
+            const settings = getSettings();
+            const previousMode = getDiagnosticsMode(settings);
+            settings.diagnosticsEnabled = enabledInput.checked;
+            const nextMode = getDiagnosticsMode(settings);
+            if (nextMode !== previousMode) {
+                diagnosticEvents.clear();
+                if (previousMode === "full" || nextMode === "privacy") logs.clear();
+            }
+            saveSettingsDebounced();
+            render();
+        };
+
+        anonymizeInput.onchange = () => {
+            const settings = getSettings();
+            if (!anonymizeInput.checked && !confirm("Full diagnostics may include message text, prompts, character information, and World Info contents. Continue?")) {
+                anonymizeInput.checked = true;
+                return;
+            }
+            const previousMode = getDiagnosticsMode(settings);
+            settings.diagnosticsAnonymize = anonymizeInput.checked;
+            const nextMode = getDiagnosticsMode(settings);
+            if (nextMode !== previousMode) {
+                diagnosticEvents.clear();
+                if (previousMode === "full" || nextMode === "privacy") logs.clear();
+            }
+            saveSettingsDebounced();
+            render();
+        };
+
+        popup.querySelector("#qig-logs-clear").onclick = () => {
+            logs.clear();
+            diagnosticEvents.clear();
+            render();
+        };
+        exportButton.onclick = downloadDiagnosticReport;
+        render();
+    }, { resizable: false });
 }
 
 function showPromptHistory() {
@@ -20919,6 +21178,7 @@ async function generateImageInjectPalette() {
             sourceText: paletteSourceText,
             signal: run.signal,
             forceTextAI: matches.length === 0,
+            route: "extension-generate:palette-inject",
         });
 
         if (matches.length === 0) {
@@ -20939,6 +21199,7 @@ async function generateImageInjectPalette() {
                 getQigApiTemplate(s, "textAiMissingTagTemplate"),
                 tagRuntime.values,
             );
+            writeWorldInfoRequestDiagnostic("missing-tag-request", fullInstruction, worldInfoContext.text);
             if (s.reviewBeforeGenerate || !!worldInfoContext.text) {
                 const reviewed = await reviewTextAIRequest(fullInstruction, {
                     title: "Review Image Tag Request",
@@ -20981,7 +21242,7 @@ async function generateImageInjectPalette() {
                 debugLog(`Palette inject: Full instruction sent: ${fullInstruction.substring(0, 300)}...`);
                 toastr.warning("No image tags found. Check console for details.", "Image Generation");
                 log(`Palette inject: Diagnostic info - regex ${regexPreview}${regexPattern.length > 100 ? "..." : ""}, sources ${aiSources}`);
-                if (debugLoggingEnabled) {
+                if (getDiagnosticsMode() === "full") {
                     debugLog(`Palette inject diagnostics: ${JSON.stringify({
                         regexPattern,
                         aiSources,
@@ -21146,6 +21407,7 @@ async function generateImageFromPlainDescription() {
             sourceText: basePrompt,
             signal: run.signal,
             forceTextAI: true,
+            route: "plain-description",
         });
         const preparedPrompt = await prepareQigFinalPrompt({
             settings: s,
@@ -21336,6 +21598,7 @@ async function generateImage() {
         throughIndex: worldInfoThroughIndex >= 0 ? worldInfoThroughIndex : null,
         sourceText: originalLLMPromptSource,
         signal: run.signal,
+        route: getTransientGenerationTarget(ctx)?.message ? "automatic-or-message-targeted:direct" : "extension-generate:direct",
     });
     if (s.twoStepPrompt && s.useLLMPrompt && useChatMessageScene && scenePrompt) {
         let sceneDescription = "";
@@ -21948,6 +22211,7 @@ async function processInjectMessage(messageText, messageIndex, job = null) {
             throughIndex: Number.isInteger(sourceMessageIndex) ? sourceMessageIndex : null,
             sourceText: sceneTextForFilters || matches.join("\n"),
             signal: run.signal,
+            route: job ? "automatic-chat:inject" : "extension-generate:inject",
         });
         for (const extractedPrompt of matches) {
             const originalSeed = getGenerationSeedValue(s);
